@@ -15,8 +15,8 @@ class HyperParam:
         valid_attr = ["Male", "No_Beard", "Wearing_Hat"]
     else:
         attr_file = None
-    batch_sizeD = 24
-    batch_sizeG = 24
+    batch_sizeD = 20
+    batch_sizeG = 20
     use_fp16 = True
     reload = False
     drift_param = None  # 0.001
@@ -43,7 +43,9 @@ class HyperParam:
     move_average_rate = 0.995
     non_blocking = False
     discriminator_augmentation_speed = 5e-3
-    use_adaptive_discriminator_augmentation = True
+    use_adaptive_discriminator_augmentation = False
+    use_contrastive_discriminator = True
+    projection_dim = 256
     truncation_trick_rate = 0.7
     w_avg_rate = 0.995
     n_mix = 2
@@ -72,6 +74,7 @@ class HyperParam:
     Gmode = "wavelet"  # [wavelet, skip]
     Dmode = "wavelet"  # [wavelet, skip, resnet]
     max_level = len(channel_info) if Gmode != "wavelet" else len(channel_info) + 1
+    resolution = 2 ** (max_level + 1)
     use_scaleSM = True
     sm_lrmul = 0.01
     use_scaleG = True

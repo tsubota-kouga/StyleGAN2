@@ -1,7 +1,7 @@
 
 import math
 import random
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, Final
 
 from kornia.filters import filter2D
 import numpy as np
@@ -902,10 +902,13 @@ class DiscriminatorV2(nn.Module):
                  eps: float,
                  channel_info: List[Tuple[int, int]],
                  mode: str = "skip",  # [resnet, skip, wavelet]
-                 use_unet_decoder: bool = True):
+                 use_unet_decoder: bool = True,
+                 use_contrastive_discriminator: bool = False,
+                 projection_dim: Optional[float] = None):
         super(DiscriminatorV2, self).__init__()
         self.mode = mode
         self.use_unet_decoder = use_unet_decoder
+        self.use_contrastive_discriminator = use_contrastive_discriminator
         if mode == "resnet":
             self.from_rgb = nn.Sequential(
                 WeightScaledConv(
@@ -950,18 +953,15 @@ class DiscriminatorV2(nn.Module):
                 last=(idx == len(channel_info) - 1))
             for idx, (out_channels, in_channels) in enumerate(reversed(channel_info))
         ])
-        self.out = nn.Sequential(
+        self.feature = nn.Sequential(
             WeightScaledConv(
                 in_channels=channel_info[0][0],
                 out_channels=channel_info[0][0],
-                kernel_size=3,
-                padding_mode="replicate",
+                kernel_size=4,
                 use_scale=use_scale),
-            nn.Flatten(),
-            WeightScaledLinear(
-                in_features=channel_info[0][0] * 2 ** 2,
-                out_features=1,
-                use_scale=use_scale))
+            Activation(activation=activation, **activation_args),
+            nn.Flatten())
+
         if use_unet_decoder:
             self.unet_convolutions = nn.ModuleList([
                 DiscriminatorDecoderBlock(
@@ -983,11 +983,57 @@ class DiscriminatorV2(nn.Module):
             self.unet_upsample = WaveletInterpolate(scale_factor=2)
             self.iwt = DWTInverse(wave="haar", mode="reflect")
 
+        if use_contrastive_discriminator:
+            assert projection_dim is not None
+            self.projection_real = nn.Sequential(
+                WeightScaledLinear(
+                    in_features=channel_info[0][0],
+                    out_features=projection_dim,
+                    use_scale=use_scale),
+                Activation(activation=activation, **activation_args),
+                WeightScaledLinear(
+                    in_features=projection_dim,
+                    out_features=projection_dim,
+                    use_scale=use_scale))
+            self.projection_fake = nn.Sequential(
+                WeightScaledLinear(
+                    in_features=channel_info[0][0],
+                    out_features=projection_dim,
+                    use_scale=use_scale),
+                Activation(activation=activation, **activation_args),
+                WeightScaledLinear(
+                    in_features=projection_dim,
+                    out_features=projection_dim,
+                    use_scale=use_scale))
+            self.projection_discriminate = nn.Sequential(
+                WeightScaledLinear(
+                    in_features=channel_info[0][0],
+                    out_features=channel_info[0][0],
+                    use_scale=use_scale),
+                Activation(activation=activation, **activation_args),
+                WeightScaledLinear(
+                    in_features=channel_info[0][0],
+                    out_features=channel_info[0][0],
+                    use_scale=use_scale),
+                Activation(activation=activation, **activation_args))
+
+        self.out = WeightScaledLinear(
+            in_features=channel_info[0][0],
+            out_features=1,
+            use_scale=use_scale)
+
     def forward(self,
-                img: torch.Tensor,
-                unet_out: bool = False
-                ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                img: torch.Tensor, *,
+                unet_out: bool = False,
+                contrastive_out: Optional[str] = None,  # [positive, negative, discriminator, generator]
+                r1_regularize: bool = False,
+                ) -> Union[Tuple[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]:
+        '''
+        img: [B, C, resolution, resolution]
+        '''
         skips: List[torch.Tensor] = []
+        grad_switch: Final = contrastive_out != "discriminator"
+        torch.set_grad_enabled(grad_switch)
         if self.mode == "resnet":
             x = self.from_rgb(img)
             for convolution in self.convolutions:
@@ -1019,12 +1065,28 @@ class DiscriminatorV2(nn.Module):
                 img = self.downsample(img)
         else:
             assert False
+        feature = self.feature(x)
+
+        if contrastive_out == "positive":
+            return self.projection_real(feature)
+        elif contrastive_out == "negative":
+            return self.projection_fake(feature)
+        elif r1_regularize:
+            if self.use_contrastive_discriminator:
+                return feature
+            else:
+                return self.out(feature)
+
+        gray: Optional[torch.Tensor] = None
         if self.use_unet_decoder and unet_out:
             y = x  # == skips[0]
-            gray: Optional[torch.Tensor] = None
+            if contrastive_out == "discriminator":
+                y = y.detach()
             for idx, (skip, to_gray, convolution) in \
                     enumerate(zip(reversed(skips), self.to_gray, self.unet_convolutions)):
                 if idx != 0:
+                    if contrastive_out == "discriminator":
+                        skip = skip.detach()
                     y = torch.cat((y, skip), dim=1)
                 y = convolution(y)
                 if idx == 0:
@@ -1036,6 +1098,17 @@ class DiscriminatorV2(nn.Module):
             grayl, grayh = torch.split(gray, split_size_or_sections=(C, 3 * C), dim=1)
             grayh = grayh.reshape(B, C, -1, H, W)
             gray = self.iwt((grayl, [grayh]))
+
+        if contrastive_out == "discriminator":
+            torch.set_grad_enabled(True)
+            x = self.projection_discriminate(feature)
+            x = self.out(x)
+            return x, gray
+        elif contrastive_out == "generator":
+            x = self.projection_discriminate(feature)
             return self.out(x), gray
-        return self.out(x), None
+        elif contrastive_out is None:
+            return self.out(feature), gray
+        else:
+            assert False
 

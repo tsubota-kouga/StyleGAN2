@@ -1,14 +1,15 @@
 
+import argparse
 import copy
 from datetime import datetime
 import math
 import os
 import random
-import argparse
+from typing import Final, Optional
 
 import numpy as np
 import torch
-from torch import cuda, nn, optim, backends
+from torch import backends, cuda, nn, optim
 from torch.utils.tensorboard import SummaryWriter
 from torch_optimizer import AdaBelief, RAdam
 from torchvision import transforms, utils
@@ -23,12 +24,13 @@ from loss import (
     LSGANGeneratorLoss,
     NonSaturatingDiscriminatorLoss,
     NonSaturatingGeneratorLoss,
+    PathLengthRegularization,
+    R1Regularization,
     RelativisticAverageHingeDiscriminatorLoss,
     RelativisticAverageHingeGeneratorLoss,
     WGANgpDiscriminatorLoss,
     WGANgpGeneratorLoss,
-    r1_regularization,
-    PathLengthRegularization,
+    # r1_regularization,
 )
 from network import DiscriminatorV2, GeneratorV2, LatentLayers
 from utils import (
@@ -54,29 +56,16 @@ if __name__ == "__main__":
         os.mkdir("./datasets")
         preprocess(hp.dataset_path[hp.dataset], hp.max_level, hp.dataroot, multi_resolution=False)
 
-    if hp.dataset == "celeba-hq":
-        dataset = CelebAHQDataset(
-            root=hp.dataroot,
-            attr_file=hp.attr_file,
-            valid_attr=hp.valid_attr,
-            multi_resolution=hp.multi_resolution,
-            transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-            ]),
-            use_fp16=hp.use_fp16)
-    else:  # hp.dataset == "ffhq" or others
-        dataset = FFHQDataset(
-            root=hp.dataroot,
-            multi_resolution=hp.multi_resolution,
-            transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-            ]),
-            use_fp16=hp.use_fp16)
+    dataset = FFHQDataset(
+        root=hp.dataroot,
+        multi_resolution=hp.multi_resolution,
+        transform=transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ]),
+        use_fp16=hp.use_fp16)
 
-
-    dataloader = torch.utils.data.DataLoader(
+    dataloader = utils.data.DataLoader(
         dataset,
         batch_size=hp.batch_sizeD,
         shuffle=True,
@@ -89,6 +78,8 @@ if __name__ == "__main__":
         channel_info=hp.channel_info,
         use_scale=hp.use_scaleD,
         use_minibatch_stddev_all=hp.use_minibatch_stddev_all,
+        use_contrastive_discriminator=hp.use_contrastive_discriminator,
+        projection_dim=hp.projection_dim,
         minibatch_stddev_groups_size=hp.minibatch_stddev_groups_size,
         mode=hp.Dmode,
         eps=hp.eps).to(hp.device, non_blocking=hp.non_blocking)
@@ -167,7 +158,10 @@ if __name__ == "__main__":
             multi_resolution=hp.multi_resolution,
             eps=hp.eps)
     elif hp.gan_loss == "non-saturating":
-        criterionG = NonSaturatingGeneratorLoss(use_unet_decoder=hp.use_unet_decoder)
+        criterionG = NonSaturatingGeneratorLoss(
+            use_unet_decoder=hp.use_unet_decoder,
+            use_contrastive_discriminator=hp.use_contrastive_discriminator,
+            resolution=hp.resolution)
         criterionD = NonSaturatingDiscriminatorLoss(
             gp_param=hp.gp_param,
             drift_param=hp.drift_param,
@@ -175,9 +169,19 @@ if __name__ == "__main__":
             r1_per=hp.r1_per,
             adaptive_augmentation=data_augmentation,
             use_unet_decoder=hp.use_unet_decoder,
+            use_contrastive_discriminator=hp.use_contrastive_discriminator,
+            resolution=hp.resolution,
             multi_resolution=hp.multi_resolution,
             eps=hp.eps)
-    path_length_regularization = PathLengthRegularization(eps=hp.eps, pl_param=hp.pl_param).to(hp.device)
+    else:
+        assert False
+    path_length_regularization = PathLengthRegularization(
+            eps=hp.eps,
+            pl_param=hp.pl_param).to(hp.device)
+    r1_regularization = R1Regularization(
+            eps=hp.eps,
+            resolution=hp.resolution,
+            use_contrastive_discriminator=hp.use_contrastive_discriminator)
 
     optimizerSM: optim.Optimizer
     optimizerG: optim.Optimizer
@@ -252,11 +256,14 @@ if __name__ == "__main__":
             discriminator.parameters(),
             lr=hp.dlr,
             eps=hp.eps)
+    else:
+        assert False
 
-    if hp.use_fp16:
-        scaler = cuda.amp.GradScaler()
+    scaler: Final[Optional[cuda.amp.GradScaler]] = \
+            cuda.amp.GradScaler() if hp.use_fp16 else None
 
     writer = SummaryWriter(log_dir="./log")
+
 
     fixed_noise = torch.randn(
             16, hp.latent_dim, 1 , 1,
@@ -312,10 +319,9 @@ if __name__ == "__main__":
 
                 if type(lossD) is tuple:
                     lossD = sum(lossD)
-
                 discriminator.zero_grad(set_to_none=True)
 
-                if hp.use_fp16:
+                if scaler is not None:  # hp.use_fp16
                     scaler.scale(lossD).backward()
                     scaler.step(optimizerD)
                     scaler.update()
@@ -328,12 +334,11 @@ if __name__ == "__main__":
 
                 if global_step % hp.r1_per == 0:
                     lossR1 = hp.r1_param * r1_regularization(
+                            imgs,
                             discriminator=discriminator,
-                            reals=imgs,
-                            eps=hp.eps,
                             scaler=scaler)
                     discriminator.zero_grad(set_to_none=True)
-                    if hp.use_fp16:
+                    if scaler is not None:  # hp.use_fp16
                         scaler.scale(lossR1).backward()
                         scaler.step(optimizerD)
                         scaler.update()
@@ -355,7 +360,7 @@ if __name__ == "__main__":
                 style_mapper.zero_grad(set_to_none=True)
                 generator.zero_grad(set_to_none=True)
 
-                if hp.use_fp16:
+                if scaler is not None:  # hp.use_fp16
                     scaler.scale(lossG).backward()
                     scaler.step(optimizerSM)
                     scaler.step(optimizerG)
@@ -386,7 +391,7 @@ if __name__ == "__main__":
 
                     generator.zero_grad(set_to_none=True)
 
-                    if hp.use_fp16:
+                    if scaler is not None:  # hp.use_fp16
                         scaler.scale(lossPL).backward()
                         scaler.step(optimizerG)
                         scaler.update()

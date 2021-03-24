@@ -565,3 +565,22 @@ def translate3d(input: torch.Tensor, t: Tuple[torch.Tensor, torch.Tensor, torch.
     operation[:, 2, 3] = tz
     return operation.bmm(input)
 
+
+class SimCLRAugmentation(nn.Module):
+    def __init__(self, resolution: int):
+        super(SimCLRAugmentation, self).__init__()
+        self.transform = nn.Sequential(
+            transforms.RandomResizedCrop(resolution),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([
+                transforms.ColorJitter(0.8, 0.8, 0.8)
+                ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomApply([
+                transforms.GaussianBlur(kernel_size=resolution * 0.1)
+                ], p=0.5),
+            transforms.RandomErasing(p=0.5))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return self.transform(input)
+
