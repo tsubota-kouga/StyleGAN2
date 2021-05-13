@@ -7,9 +7,8 @@ from kornia.filters import filter2D
 import numpy as np
 from pytorch_wavelets import DWTForward, DWTInverse
 import torch
-from torch import nn
+from torch import nn, cuda
 from torch.nn import functional as F
-from torch.nn.utils import spectral_norm
 
 
 class Print(nn.Module):
@@ -49,11 +48,13 @@ class Activation(nn.Module):
 class Blur(nn.Module):
     def __init__(self, kernel_size: int):
         super(Blur, self).__init__()
-        filter = torch.tensor([1., 2., 1.])
-        filter = filter[None, None, :] * filter[None, :, None]  # [1, K, K]
         if kernel_size == 4:
-            filter = fuse_weight(filter)
-        self.register_buffer("filter", filter)
+            filter = torch.tensor([1., 3., 3., 1.])
+            # filter = fuse_weight(filter)
+        else:
+            filter = torch.tensor([1., 2., 1.])
+        filter = filter[None, None, :] * filter[None, :, None]  # [1, K, K]
+        self.register_buffer("filter", filter.requires_grad_(False))
 
     def forward(self, input: torch.Tensor):
         return filter2D(
@@ -73,6 +74,7 @@ def fuse_weight(weight: torch.Tensor):
 
 
 class Up(nn.Module):
+    '''Upsample with 0'''
     def __init__(self, scale: int = 1):
         super(Up, self).__init__()
         self.scale = scale
@@ -131,11 +133,14 @@ class WaveletInterpolate(nn.Module):
         C = CW // 4
         # yl: [B, 3, H, W], yh: [B, 9, H, W]
         xl, xh = torch.split(x, split_size_or_sections=(C, 3 * C), dim=1)
-        xh = xh.reshape(B, C, -1, H, W)
-        x = self.iwt((xl, [xh]))
-        x = F.interpolate(x, scale_factor=self.scale_factor, mode="bilinear", align_corners=False)
-        xl, xh = self.dwt(x)
-        xh = xh[0].reshape(B, -1, int(self.scale_factor * H), int(self.scale_factor * W))
+        xh = xh.reshape(B, C, 3, H, W)
+        x = self.iwt((xl, (xh,)))
+        x = F.interpolate(x,
+                          scale_factor=self.scale_factor,
+                          mode="bilinear",
+                          align_corners=False)
+        xl, (xh, ) = self.dwt(x)
+        xh = xh.reshape(B, -1, int(self.scale_factor * H), int(self.scale_factor * W))
         x = torch.cat((xl, xh), dim=1)
         return x
 
@@ -163,10 +168,11 @@ class WeightScaledLinear(nn.Linear):
 
 
 class WeightScaledConv(nn.Conv2d):
-    def __init__(self, use_scale: bool, lrmul: float = 1., *args, **kwargs):
+    def __init__(self, use_scale: bool, lrmul: float = 1., use_fp16: bool = False, *args, **kwargs):
         super(WeightScaledConv, self).__init__(*args, **kwargs)
         he_std = math.sqrt(1 / np.prod(self.weight.shape[1:]))
         self.lrmul = lrmul
+        self.use_fp16 = use_fp16
         if use_scale:
             init_std = 1. / lrmul
             self.scale = he_std * lrmul
@@ -177,23 +183,27 @@ class WeightScaledConv(nn.Conv2d):
         if self.bias is not None:
             nn.init.zeros_(self.bias.data)
 
-    def forward(self, input: torch.Tensor):
-        weight = self.weight * self.scale
-        return F.conv2d(
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        output = F.conv2d(
             input=input,
-            weight=weight,
+            weight=self.weight * self.scale,
             bias=None if self.bias is None else self.bias * self.lrmul,
             stride=self.stride,
             padding=self.padding,
             groups=self.groups,
             dilation=self.dilation)
+        if self.use_fp16:
+            abs = 2 ** 8
+            output.clamp_(min=-abs, max=abs)
+        return output
 
 
 class WeightScaledConvTrans(nn.ConvTranspose2d):
-    def __init__(self, use_scale: bool, lrmul: float = 1., *args, **kwargs):
+    def __init__(self, use_scale: bool, lrmul: float = 1., use_fp16: bool = False, *args, **kwargs):
         super(WeightScaledConvTrans, self).__init__(*args, **kwargs)
         he_std = math.sqrt(1 / (self.in_channels * np.prod(self.kernel_size)))
         self.lrmul = lrmul
+        self.use_fp16 = use_fp16
         if use_scale:
             init_std = 1. / lrmul
             self.scale = he_std * lrmul
@@ -212,7 +222,7 @@ class WeightScaledConvTrans(nn.ConvTranspose2d):
             list(self.stride),
             list(self.padding),
             list(self.kernel_size))
-        return F.conv_transpose2d(
+        output = F.conv_transpose2d(
             input=input,
             weight=weight,
             bias=None if self.bias is None else self.bias * self.lrmul,
@@ -221,6 +231,10 @@ class WeightScaledConvTrans(nn.ConvTranspose2d):
             output_padding=output_padding,
             groups=self.groups,
             dilation=self.dilation)
+        if self.use_fp16:
+            abs = 2 ** 8
+            output.clamp_(min=-abs, max=abs)
+        return output
 
 
 class WeightModulatedConv(nn.Conv2d):
@@ -230,12 +244,14 @@ class WeightModulatedConv(nn.Conv2d):
                  eps: float,
                  demodulate: bool = True,
                  lrmul: float = 1.,
+                 use_fp16: bool = False,
                  *args, **kwargs):
         super(WeightModulatedConv, self).__init__(*args, **kwargs)
         self.eps = eps
         self.demodulate = demodulate
         he_std = math.sqrt(1 / np.prod(self.weight.shape[1:]))
         self.lrmul = lrmul
+        self.use_fp16 = use_fp16
         if use_scale:
             init_std = 1. / lrmul
             self.scale = he_std * lrmul
@@ -258,6 +274,10 @@ class WeightModulatedConv(nn.Conv2d):
         style = self.style_affine(style).unsqueeze(1)  # [B, 1, Ci, 1, 1]
         weight = self.weight.unsqueeze(0) \
                 .expand(B, -1, -1, -1, -1)  # [B, Co, Ci, K, K]
+        if self.use_fp16:
+            style = F.normalize(style)
+            d = (weight.square().sum(dim=(2, 3, 4), keepdim=True) + self.eps).rsqrt()
+            weight = weight * d
         weight = weight * (style + 1.) * self.scale
         if self.demodulate:
             d = (weight.square().sum(dim=(2, 3, 4), keepdim=True) + self.eps).rsqrt()
@@ -280,6 +300,9 @@ class WeightModulatedConv(nn.Conv2d):
         HW = list(output.shape[-2:])
         output = output.reshape(B, -1, *HW)
 
+        if self.use_fp16:
+            abs = 2 ** 8
+            output.clamp_(min=-abs, max=abs)
         return output
 
 
@@ -290,12 +313,14 @@ class WeightModulatedConvTrans(nn.ConvTranspose2d):
                  eps: float,
                  demodulate: bool = True,
                  lrmul: float = 1.,
+                 use_fp16: bool = False,
                  *args, **kwargs):
         super(WeightModulatedConvTrans, self).__init__(*args, **kwargs)
         self.eps = eps
         self.demodulate = demodulate
         he_std = math.sqrt(1 / (self.in_channels * np.prod(self.kernel_size)))
         self.lrmul = lrmul
+        self.use_fp16 = use_fp16
         if use_scale:
             init_std = 1. / lrmul
             self.scale = he_std * lrmul
@@ -318,6 +343,10 @@ class WeightModulatedConvTrans(nn.ConvTranspose2d):
         style = self.style_affine(style).unsqueeze(2)  # [B, Ci, 1, 1, 1]
         weight = self.weight.unsqueeze(0) \
                             .expand(B, -1, -1, -1, -1)  # [B, Ci, Co, K, K]
+        if self.use_fp16:
+            style = F.normalize(style)
+            d = (weight.square().sum(dim=(1, 3, 4), keepdim=True) + self.eps).rsqrt()
+            weight = weight * d
         weight = weight * (style + 1.) * self.scale
         if self.demodulate:
             d = (weight.square().sum(dim=(1, 3, 4), keepdim=True) + self.eps).rsqrt()
@@ -340,6 +369,9 @@ class WeightModulatedConvTrans(nn.ConvTranspose2d):
             groups=B)
         HW = list(output.shape[-2:])
         output = output.reshape(B, -1, *HW)
+        if self.use_fp16:
+            abs = 2 ** 8
+            output.clamp_(min=-abs, max=abs)
         return output
 
 
@@ -390,8 +422,7 @@ class AdaIN(nn.Module):
             in_channels=style_channels,
             out_channels=in_channels * 2,
             kernel_size=1,
-            use_scale=use_scale,
-            bias=True)
+            use_scale=use_scale)
         self.instance_norm = nn.InstanceNorm2d(num_features=in_channels)
 
     def forward(self, input: torch.Tensor, style: torch.Tensor):
@@ -428,7 +459,7 @@ class GeneratorBlockV1(nn.Module):
             self.noise1 = NoiseBlock(
                 channels=in_channels,
                 resolution=self.resolution,
-                mode=noise_mode)
+                mode=noise_mode,)
             self.adain1 = AdaIN(
                 in_channels=in_channels,
                 style_channels=style_channels,
@@ -438,7 +469,6 @@ class GeneratorBlockV1(nn.Module):
                 out_channels=out_channels,
                 kernel_size=3,
                 padding=1,
-                bias=True,
                 padding_mode="replicate",
                 use_scale=use_scale)
             self.noise2 = NoiseBlock(
@@ -456,7 +486,6 @@ class GeneratorBlockV1(nn.Module):
                 kernel_size=4,
                 padding=1,
                 stride=2,
-                bias=True,
                 use_scale=use_scale)
             self.blur = Blur(kernel_size=3)
             self.noise1 = NoiseBlock(
@@ -472,7 +501,6 @@ class GeneratorBlockV1(nn.Module):
                 out_channels=out_channels,
                 kernel_size=3,
                 padding=1,
-                bias=True,
                 padding_mode="replicate",
                 use_scale=use_scale)
             self.noise2 = NoiseBlock(
@@ -490,7 +518,7 @@ class GeneratorBlockV1(nn.Module):
                 style: torch.Tensor):
         B = style.shape[0]
         if self.noise_mode == "const-random":
-            noise = torch.randn(1, 1, self.resolution, self.resolution)
+            noise = torch.randn(1, 1, self.resolution, self.resolution, device=style.device)
         else:
             noise = self.noise
         if self.first:
@@ -527,7 +555,8 @@ class GeneratorBlockV2(nn.Module):
                  use_scale: bool,
                  eps: float,
                  noise_mode: str,
-                 idx: int):
+                 idx: int,
+                 use_fp16: bool):
         super(GeneratorBlockV2, self).__init__()
         self.first = idx == 0
         self.resolution = 2 ** (idx + 2)
@@ -548,25 +577,33 @@ class GeneratorBlockV2(nn.Module):
                 style_channels=style_channels,
                 kernel_size=3,
                 padding=1,
-                bias=True,
                 padding_mode="replicate",
                 use_scale=use_scale,
-                eps=eps)
+                eps=eps,
+                use_fp16=use_fp16,
+                bias=True)
+            self.noise1 = NoiseBlock(
+                channels=1,
+                resolution=self.resolution,
+                mode=noise_mode)
         else:
-            self.conv1 = WeightModulatedConvTrans(
+            self.upsample = nn.Sequential(
+                Up(scale=2),
+                Blur(kernel_size=3))
+            self.conv1 = WeightModulatedConv(
                 in_channels=in_channels,
                 out_channels=out_channels,
                 style_channels=style_channels,
-                kernel_size=4,
+                kernel_size=3,
                 padding=1,
-                stride=2,
-                bias=True,
+                padding_mode="replicate",
                 use_scale=use_scale,
-                eps=eps)
-            self.blur = Blur(kernel_size=3)
+                eps=eps,
+                use_fp16=use_fp16,
+                bias=True)
 
             self.noise1 = NoiseBlock(
-                channels=out_channels,
+                channels=1,
                 resolution=self.resolution,
                 mode=noise_mode)
             self.conv2 = WeightModulatedConv(
@@ -575,12 +612,13 @@ class GeneratorBlockV2(nn.Module):
                 style_channels=style_channels,
                 kernel_size=3,
                 padding=1,
-                bias=True,
                 padding_mode="replicate",
                 use_scale=use_scale,
-                eps=eps)
+                eps=eps,
+                use_fp16=use_fp16,
+                bias=True)
             self.noise2 = NoiseBlock(
-                channels=out_channels,
+                channels=1,
                 resolution=self.resolution,
                 mode=noise_mode)
 
@@ -590,18 +628,21 @@ class GeneratorBlockV2(nn.Module):
                 style: torch.Tensor):
         B = style.shape[0]
         if self.noise_mode == "const-random":
-            noise = torch.randn(1, 1, self.resolution, self.resolution)
+            noise = torch.randn(1, 1, self.resolution, self.resolution, device=style.device)
         else:
             noise = self.noise
         if self.first:
             x = self.conv1(self.const.expand(B, -1, -1, -1), style)
+            x = self.noise1(x, noise)
             x = self.activation(x)
             return x
         else:
+            x = self.upsample(x)
+
             x = self.conv1(x, style)
-            x = self.blur(x)
             x = self.noise1(x, noise)
             x = self.activation(x)
+
             x = self.conv2(x, style)
             x = self.noise2(x, noise)
             x = self.activation(x)
@@ -628,7 +669,6 @@ class LatentLayers(nn.Module):
                     out_channels=style_channels,
                     kernel_size=1,
                     use_scale=use_scale,
-                    bias=True,
                     lrmul=lrmul),
                 Activation(
                     activation=activation,
@@ -683,10 +723,12 @@ class GeneratorV2(nn.Module):
                  eps: float,
                  noise_mode: str,
                  channel_info: List[Tuple[int, int]],
+                 use_fp16: bool,
                  mode: str = "skip"  # [skip, wavelet]
                  ):
         super(GeneratorV2, self).__init__()
         self.mode = mode
+        self.use_fp16 = use_fp16
         self.convolutions = nn.ModuleList([
             GeneratorBlockV2(
                 in_channels=in_channels,
@@ -697,6 +739,7 @@ class GeneratorV2(nn.Module):
                 use_scale=use_scale,
                 eps=eps,
                 noise_mode=noise_mode,
+                use_fp16=use_fp16,
                 idx=idx)
             for idx, (in_channels, out_channels) in enumerate(channel_info)
             ])
@@ -708,6 +751,7 @@ class GeneratorV2(nn.Module):
                 kernel_size=1,
                 use_scale=use_scale,
                 eps=eps,
+                use_fp16=use_fp16,
                 demodulate=False,
                 bias=True)
             for _, out_channels in channel_info
@@ -736,7 +780,7 @@ class GeneratorV2(nn.Module):
                 B, _, H, W = x.shape
                 C = 3
                 imgl, imgh = torch.split(img, split_size_or_sections=(C, 3 * C), dim=1)
-                imgh = imgh.reshape(B, C, -1, H, W)
+                imgh = imgh.reshape(B, C, 3, H, W)
                 imgs.append(self.iwt((imgl, [imgh])))
             elif self.mode == "skip":
                 imgs.append(img)
@@ -749,15 +793,17 @@ class MiniBatchStdDev(nn.Module):
         self.group_size = group_size
         self.eps = eps
 
-    def forward(self, input) -> torch.Tensor:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         B, C, *HW = input.shape
-        M = B // self.group_size
-        x = input.reshape([self.group_size, M, C, *HW])
-        x = x - x.mean(dim=0, keepdim=True)  # [1, M, C, *HW]
-        x = (x.square().mean(dim=0) + self.eps).sqrt()  # [M, C, *HW]
+        G = min(B, self.group_size)
+        M = B // G
+        x = input.reshape([G, M, C, *HW])  # [G, M, C, H, W]
+        # x = x.std(dim=0, unbiased=False)
+        x = (x.var(dim=0, unbiased=False) + self.eps).sqrt()
         x = x.mean(dim=(1, 2, 3), keepdim=True)  # [M, 1, 1, 1]
-        x = x.repeat(self.group_size, 1, *HW)
+        x = x.repeat(G, 1, *HW)
         return torch.cat((input, x), dim=1)
+
     # def forward(self, input):
     #     B, C, *HW = input.shape
     #     y = input - input.mean(dim=0, keepdim=True)
@@ -778,45 +824,43 @@ class DiscriminatorBlock(nn.Module):
                  use_scale: bool,
                  eps: float,
                  mode: str,
-                 last: bool = False):
+                 use_fp16:bool):
         super(DiscriminatorBlock, self).__init__()
         self.mode = mode
-        self.last = last
         self.use_minibatch_stddev_all = use_minibatch_stddev_all
         if mode == "resnet":
             self.residual = nn.Sequential(
-                Blur(kernel_size=3),
+                Blur(kernel_size=3), Down(scale=2),
                 WeightScaledConv(
                     in_channels=in_channels,
                     out_channels=out_channels,
-                    kernel_size=3,
+                    kernel_size=1,
                     use_scale=use_scale,
-                    padding_mode="replicate",
-                    bias=True),
-                *([] if last else [Down(scale=2)]))
+                    padding_mode="replicate"))
                 # WeightScaledConv(
                 #     in_channels=in_channels,
                 #     out_channels=out_channels,
                 #     kernel_size=1,
-                #     stride=1 if last else 2,
+                #     stride=2,
                 #     use_scale=use_scale,
                 #     bias=True))
-        if last or use_minibatch_stddev_all:
+        if use_minibatch_stddev_all:
             self.minibatch_stddev = MiniBatchStdDev(
                 eps=eps,
                 group_size=minibatch_stddev_groups_size)
         self.net = nn.Sequential(
             WeightScaledConv(
-                in_channels=in_channels + 1 if last or use_minibatch_stddev_all else in_channels,
+                in_channels=in_channels + 1 if use_minibatch_stddev_all else in_channels,
                 out_channels=out_channels,
                 kernel_size=3,
                 padding=1,
                 use_scale=use_scale,
                 padding_mode="replicate",
-                bias=True),
+                use_fp16=use_fp16),
             Activation(
                 activation=activation,
                 **activation_args),
+            Blur(kernel_size=3), Down(scale=2),
             WeightScaledConv(
                 in_channels=out_channels,
                 out_channels=out_channels,
@@ -824,8 +868,7 @@ class DiscriminatorBlock(nn.Module):
                 padding=1,
                 use_scale=use_scale,
                 padding_mode="replicate",
-                bias=True),
-            *([ Blur(kernel_size=3), Down(scale=2) ] if not last else []),
+                use_fp16=use_fp16),
             Activation(
                 activation=activation,
                 **activation_args))
@@ -833,12 +876,12 @@ class DiscriminatorBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.mode == "resnet":  # img is None
             residual = self.residual(x)
-            if self.last or self.use_minibatch_stddev_all:
+            if self.use_minibatch_stddev_all:
                 x = self.minibatch_stddev(x)
             x = self.net(x)
             x = (x + residual) / np.sqrt(2)
         elif self.mode == "skip" or self.mode == "wavelet":  # x may be None
-            if self.last or self.use_minibatch_stddev_all:
+            if self.use_minibatch_stddev_all:
                 x = self.minibatch_stddev(x)
             x = self.net(x)
         else:
@@ -852,14 +895,15 @@ class DiscriminatorDecoderBlock(nn.Module):
                  out_channels: int,
                  activation: str,
                  activation_args: Dict,
-                 use_scale: bool):
+                 use_scale: bool,
+                 use_fp16: bool):
         super(DiscriminatorDecoderBlock, self).__init__()
         self.residual = WeightScaledConv(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=1,
-            bias=True,
-            use_scale=use_scale)
+            use_scale=use_scale,
+            use_fp16=use_fp16)
         self.activation = Activation(activation=activation, **activation_args)
         self.conv1 = WeightScaledConvTrans(
             in_channels=in_channels,
@@ -867,24 +911,24 @@ class DiscriminatorDecoderBlock(nn.Module):
             kernel_size=4,
             padding=1,
             stride=2,
-            bias=True,
-            use_scale=use_scale)
+            use_scale=use_scale,
+            use_fp16=use_fp16)
         self.conv2 = WeightScaledConv(
             in_channels=out_channels,
             out_channels=out_channels,
             kernel_size=3,
             padding=1,
-            bias=True,
-            use_scale=use_scale)
+            use_scale=use_scale,
+            use_fp16=use_fp16)
         self.to_gray = WeightScaledConv(
             in_channels=out_channels,
             out_channels=4,
             kernel_size=1,
-            bias=True,
-            use_scale=use_scale)
+            use_scale=use_scale,
+            use_fp16=use_fp16)
         self.iwt = DWTInverse(wave="haar", mode="reflect")
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv1(x)
         x = self.activation(x)
         x = self.conv2(x)
@@ -901,6 +945,7 @@ class DiscriminatorV2(nn.Module):
                  use_scale: bool,
                  eps: float,
                  channel_info: List[Tuple[int, int]],
+                 use_fp16: bool,
                  mode: str = "skip",  # [resnet, skip, wavelet]
                  use_unet_decoder: bool = True,
                  use_contrastive_discriminator: bool = False,
@@ -909,6 +954,7 @@ class DiscriminatorV2(nn.Module):
         self.mode = mode
         self.use_unet_decoder = use_unet_decoder
         self.use_contrastive_discriminator = use_contrastive_discriminator
+        self.use_fp16 = use_fp16
         if mode == "resnet":
             self.from_rgb = nn.Sequential(
                 WeightScaledConv(
@@ -950,17 +996,25 @@ class DiscriminatorV2(nn.Module):
                 use_scale=use_scale,
                 eps=eps,
                 mode=mode,
-                last=(idx == len(channel_info) - 1))
-            for idx, (out_channels, in_channels) in enumerate(reversed(channel_info))
+                use_fp16=use_fp16)
+            for out_channels, in_channels in reversed(channel_info[1:])
         ])
-        self.feature = nn.Sequential(
+        self.feature = nn.Sequential(  # 4x4 -> 2x2
+            MiniBatchStdDev(
+                eps=eps,
+                group_size=minibatch_stddev_groups_size),
             WeightScaledConv(
-                in_channels=channel_info[0][0],
+                in_channels=channel_info[0][0] + 1,
                 out_channels=channel_info[0][0],
-                kernel_size=4,
+                kernel_size=3,
                 use_scale=use_scale),
             Activation(activation=activation, **activation_args),
-            nn.Flatten())
+            nn.Flatten(),
+            WeightScaledLinear(
+                in_features=channel_info[0][0] * 4,
+                out_features=channel_info[0][0],
+                use_scale=use_scale),
+            Activation(activation=activation, **activation_args))
 
         if use_unet_decoder:
             self.unet_convolutions = nn.ModuleList([
@@ -969,7 +1023,8 @@ class DiscriminatorV2(nn.Module):
                     out_channels=out_channels,
                     activation=activation,
                     activation_args=activation_args,
-                    use_scale=use_scale)
+                    use_scale=use_scale,
+                    use_fp16=use_fp16)
                 for idx, (in_channels, out_channels) in enumerate(channel_info[1:])
             ])
             self.to_gray = nn.ModuleList([
@@ -977,7 +1032,6 @@ class DiscriminatorV2(nn.Module):
                     in_channels=in_channels,
                     out_channels=4,
                     kernel_size=1,
-                    bias=True,
                     use_scale=use_scale)
                 for _, in_channels in channel_info[1:]])
             self.unet_upsample = WaveletInterpolate(scale_factor=2)
@@ -985,7 +1039,7 @@ class DiscriminatorV2(nn.Module):
 
         if use_contrastive_discriminator:
             assert projection_dim is not None
-            self.projection_real = nn.Sequential(
+            self.projection_positive = nn.Sequential(
                 WeightScaledLinear(
                     in_features=channel_info[0][0],
                     out_features=projection_dim,
@@ -994,119 +1048,182 @@ class DiscriminatorV2(nn.Module):
                 WeightScaledLinear(
                     in_features=projection_dim,
                     out_features=projection_dim,
-                    use_scale=use_scale))
-            self.projection_fake = nn.Sequential(
-                WeightScaledLinear(
-                    in_features=channel_info[0][0],
-                    out_features=projection_dim,
-                    use_scale=use_scale),
-                Activation(activation=activation, **activation_args),
-                WeightScaledLinear(
-                    in_features=projection_dim,
-                    out_features=projection_dim,
-                    use_scale=use_scale))
-            self.projection_discriminate = nn.Sequential(
-                WeightScaledLinear(
-                    in_features=channel_info[0][0],
-                    out_features=channel_info[0][0],
-                    use_scale=use_scale),
-                Activation(activation=activation, **activation_args),
-                WeightScaledLinear(
-                    in_features=channel_info[0][0],
-                    out_features=channel_info[0][0],
                     use_scale=use_scale),
                 Activation(activation=activation, **activation_args))
+            self.projection_negative = nn.Sequential(
+                WeightScaledLinear(
+                    in_features=channel_info[0][0],
+                    out_features=projection_dim,
+                    use_scale=use_scale),
+                Activation(activation=activation, **activation_args),
+                WeightScaledLinear(
+                    in_features=projection_dim,
+                    out_features=projection_dim,
+                    use_scale=use_scale),
+                Activation(activation=activation, **activation_args))
+            self.out = nn.Sequential(
+                WeightScaledLinear(
+                    in_features=channel_info[0][0],
+                    out_features=channel_info[0][0],
+                    use_scale=use_scale),
+                Activation(activation=activation, **activation_args),
+                WeightScaledLinear(
+                    in_features=channel_info[0][0],
+                    out_features=projection_dim,
+                    use_scale=use_scale),
+                Activation(activation=activation, **activation_args),
+                WeightScaledLinear(
+                    in_features=projection_dim,
+                    out_features=1,
+                    use_scale=use_scale))
+        else:
+            self.out = WeightScaledLinear(
+                in_features=channel_info[0][0],
+                out_features=1,
+                use_scale=use_scale)
 
-        self.out = WeightScaledLinear(
-            in_features=channel_info[0][0],
-            out_features=1,
-            use_scale=use_scale)
+    def get_feature_with_resnet(self, img: torch.Tensor) \
+            -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        skips: List[torch.Tensor] = []
+        x = self.from_rgb(img)
+        for convolution in self.convolutions:
+            if self.use_unet_decoder:
+                skips.append(x)
+            x = convolution(x)
+        return x, self.feature(x), skips
+
+    def get_feature_with_skip(self, img: torch.Tensor) \
+            -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        skips: List[torch.Tensor] = []
+        x: Optional[torch.Tensor] = None
+        for from_rgb, convolution in zip(self.from_rgb, self.convolutions):
+            if x is None:
+                x = from_rgb(img)
+            else:
+                x = x + from_rgb(img)
+            if self.use_unet_decoder:
+                assert x is not None
+                skips.append(x)
+            x = convolution(x)
+            img = self.downsample(img)
+        assert x is not None
+        return x, self.feature(x), skips
+
+    def get_feature_with_wavelet(self, img: torch.Tensor) \
+            -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        skips: List[torch.Tensor] = []
+        x: Optional[torch.Tensor] = None
+        imgl, (imgh, ) = self.dwt(img)
+        B, _, H, W = img.shape
+        img = torch.cat((imgl, imgh.reshape(B, -1, H // 2, W // 2)), dim=1)
+        for from_rgb, convolution in zip(self.from_rgb, self.convolutions):
+            if x is None:
+                x = from_rgb(img)
+            else:
+                x = x + from_rgb(img)
+            if self.use_unet_decoder:
+                assert x is not None
+                skips.append(x)
+            x = convolution(x)
+            img = self.downsample(img)
+        assert x is not None
+        return x, self.feature(x), skips
+
+    def get_unet_out(self,
+                     x: torch.Tensor,
+                     skips: List[torch.Tensor],
+                     contrastive_out: Optional[str]) -> torch.Tensor:
+        gray: Optional[torch.Tensor] = None
+        y = x
+        if contrastive_out == "discriminator":
+            y = y.detach()
+        for idx, (skip, to_gray, convolution) in \
+                enumerate(zip(reversed(skips), self.to_gray, self.unet_convolutions)):
+            if idx != 0:
+                if contrastive_out == "discriminator":
+                    skip = skip.detach()
+                y = torch.cat((y, skip), dim=1)
+            y = convolution(y)
+            if idx == 0:
+                gray = to_gray(y)
+            else:
+                gray = to_gray(y) + self.unet_upsample(gray)
+        assert gray is not None
+        B, CW, H, W = gray.shape
+        C = CW // 4
+        grayl, grayh = torch.split(gray, split_size_or_sections=(C, 3 * C), dim=1)
+        grayh = grayh.reshape(B, C, -1, H, W)
+        gray = self.iwt((grayl, [grayh]))
+        assert gray is not None
+        return gray
 
     def forward(self,
-                img: torch.Tensor, *,
+                img: Optional[torch.Tensor] = None, *,
+                feature: Optional[torch.Tensor] = None,
                 unet_out: bool = False,
-                contrastive_out: Optional[str] = None,  # [positive, negative, discriminator, generator]
+                contrastive_out: Optional[str] = None,  # [positive, negative, discriminator, generator, feature]
                 r1_regularize: bool = False,
-                ) -> Union[Tuple[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]:
+                ) -> Union[
+                        Tuple[torch.Tensor, Optional[torch.Tensor]],
+                        torch.Tensor]:
         '''
         img: [B, C, resolution, resolution]
+        unet_out:
+            weather outputs unet output or not
+        contrastive_out:
+            positive -> project feature with projection_positive
+            negative -> project feature with projection_negative
+            discriminator -> project feature with out
+            feature -> return feature
+        r1_regularize:
+            if use contrastive discriminator, return feature, otherwise return output of GAN discriminator
         '''
+        if feature is not None:
+            if contrastive_out == "positive":
+                return self.projection_positive(feature)
+            elif contrastive_out == "negative":
+                return self.projection_negative(feature)
+            elif contrastive_out == "discriminator":
+                assert not unet_out, "if unet_out, cannot get output of unet decoder from feature."
+                return self.out(feature)
+            else:
+                assert False, "contrastive_out must be positive or negative when feature was given."
+        assert img is not None
+
         skips: List[torch.Tensor] = []
-        grad_switch: Final = contrastive_out != "discriminator"
+        grad_switch: Final = contrastive_out != "discriminator" and not r1_regularize
         torch.set_grad_enabled(grad_switch)
         if self.mode == "resnet":
-            x = self.from_rgb(img)
-            for convolution in self.convolutions:
-                x = convolution(x)
+            x, feature, skips = self.get_feature_with_resnet(img)
         elif self.mode == "skip":
-            x = None
-            for from_rgb, convolution in zip(self.from_rgb, self.convolutions):
-                if x is None:
-                    x = from_rgb(img)
-                else:
-                    x = x + from_rgb(img)
-                if self.use_unet_decoder:
-                    skips.append(x)
-                x = convolution(x)
-                img = self.downsample(img)
+            x, feature, skips = self.get_feature_with_skip(img)
         elif self.mode == "wavelet":
-            x = None
-            imgl, imgh = self.dwt(img)
-            B, _, H, W = img.shape
-            img = torch.cat((imgl, imgh[0].reshape(B, -1, H // 2, W // 2)), dim=1)
-            for from_rgb, convolution in zip(self.from_rgb, self.convolutions):
-                if x is None:
-                    x = from_rgb(img)
-                else:
-                    x = x + from_rgb(img)
-                if self.use_unet_decoder:
-                    skips.append(x)
-                x = convolution(x)
-                img = self.downsample(img)
+            x, feature, skips = self.get_feature_with_wavelet(img)
         else:
             assert False
-        feature = self.feature(x)
 
         if contrastive_out == "positive":
-            return self.projection_real(feature)
+            return self.projection_positive(feature)
         elif contrastive_out == "negative":
-            return self.projection_fake(feature)
+            return self.projection_negative(feature)
+        elif contrastive_out == "feature":
+            return feature
         elif r1_regularize:
-            if self.use_contrastive_discriminator:
-                return feature
-            else:
-                return self.out(feature)
+            torch.set_grad_enabled(True)
+            feature.requires_grad_(True)
+            return self.out(feature), feature
 
         gray: Optional[torch.Tensor] = None
         if self.use_unet_decoder and unet_out:
-            y = x  # == skips[0]
-            if contrastive_out == "discriminator":
-                y = y.detach()
-            for idx, (skip, to_gray, convolution) in \
-                    enumerate(zip(reversed(skips), self.to_gray, self.unet_convolutions)):
-                if idx != 0:
-                    if contrastive_out == "discriminator":
-                        skip = skip.detach()
-                    y = torch.cat((y, skip), dim=1)
-                y = convolution(y)
-                if idx == 0:
-                    gray = to_gray(y)
-                else:
-                    gray = to_gray(y) + self.unet_upsample(gray)
-            B, CW, H, W = gray.shape
-            C = CW // 4
-            grayl, grayh = torch.split(gray, split_size_or_sections=(C, 3 * C), dim=1)
-            grayh = grayh.reshape(B, C, -1, H, W)
-            gray = self.iwt((grayl, [grayh]))
+            gray = self.get_unet_out(x, skips, contrastive_out)
 
+        # contrastive
         if contrastive_out == "discriminator":
             torch.set_grad_enabled(True)
-            x = self.projection_discriminate(feature)
-            x = self.out(x)
-            return x, gray
+            return self.out(feature), gray
         elif contrastive_out == "generator":
-            x = self.projection_discriminate(feature)
-            return self.out(x), gray
+            return self.out(feature), gray
+        # not contrastive
         elif contrastive_out is None:
             return self.out(feature), gray
         else:

@@ -10,16 +10,16 @@ import re
 from typing import List, Optional, Tuple, Union
 
 from PIL import Image
-import kornia
-from kornia import augmentation, geometry
+from kornia import geometry
 import numpy as np
-from pytorch_wavelets import DWTForward, DWTInverse
+import pywt
 from skimage import io
 import torch
 from torch import distributions, nn, jit
 from torch.nn import functional as F
 from torch.utils import data
 from torchvision import transforms
+from pytorch_wavelets import DWTForward, DWTInverse
 from tqdm import tqdm
 
 
@@ -271,6 +271,47 @@ def uniform(
     return (range[0] - range[1]) * torch.rand(size=size, device=device, dtype=dtype) + range[1]
 
 
+def wavelet_bandpass_filters(wt: str) -> torch.Tensor:
+    def upsample_by_pad_0(input: np.ndarray) -> np.ndarray:
+        return np.insert(input, slice(1, None), 0)
+    filter_bank = pywt.Wavelet(wt).filter_bank
+    filter_bank = list(map(lambda f: np.array(f, dtype=np.float128), filter_bank))
+    filter_bank_upx2 = list(map(upsample_by_pad_0, filter_bank))
+    filter_bank_upx4 = list(map(upsample_by_pad_0, filter_bank_upx2))
+
+    H_z, H_minus_z_inv, H_z_inv, H_minus_z = filter_bank  # H(z), H(-z^-1), H(z^-1), H(-z)
+    H_z_2, H_minus_z_inv_2, H_z_inv_2, H_minus_z_2 = filter_bank_upx2  # H(z^2), H(-z^-2), H(z^-2), H(-z^2)
+    H_z_4, H_minus_z_inv_4, H_z_inv_4, H_minus_z_4 = filter_bank_upx4  # H(z^4), H(-z^-4), H(z^-4), H(-z^4)
+
+    H_z_H_z_inv = np.convolve(H_z_inv, H_z)  # H(z)H(z^-1)
+    H_minus_z_H_minus_z_inv = np.convolve(H_minus_z_inv, H_minus_z)  # H(-z)H(-z^-1)
+    H_z_2_H_z_inv_2 = np.convolve(H_z_inv_2, H_z_2)  # H(z^2)H(z^-2)
+    H_minus_z_2_H_minus_z_inv_2 = np.convolve(H_minus_z_inv_2, H_minus_z_2)  # H(-z^2)H(-z^-2)
+    H_z_4_H_z_inv_4 = np.convolve(H_z_inv_4, H_z_4)  # H(z^4)H(z^-4)
+    H_minus_z_4_H_minus_z_inv_4 = np.convolve(H_minus_z_inv_4, H_minus_z_4)  # H(-z^4)H(-z^-4)
+    filter1 = np.convolve(H_z_4_H_z_inv_4, np.convolve(H_z_2_H_z_inv_2, H_z_H_z_inv))  # H(z)H(z^-1)H(z^2)H(z^-2)H(z^4)H(z^-4)/8
+    filter2 = np.convolve(H_minus_z_4_H_minus_z_inv_4, np.convolve(H_z_2_H_z_inv_2, H_z_H_z_inv))  # H(z)H(z^-1)H(z^2)H(z^-2)H(-z^4)H(-z^-4)/8
+    filter3 = np.convolve(H_minus_z_2_H_minus_z_inv_2, H_z_H_z_inv)  # H(z)H(z^-1)H(-z^2)H(-z^-2)/4
+    filter4 = H_minus_z_H_minus_z_inv  # H(-z)H(-z^-1)
+
+    # pad with 0
+    def pad_like(input: np.ndarray, like: np.ndarray) -> np.ndarray:
+        pad_length = like.shape[0] - input.shape[0]
+        pre_pad_size = pad_length // 2
+        post_pad_size = pad_length - pre_pad_size
+        return np.pad(input, (pre_pad_size, post_pad_size))
+    filter3 = pad_like(filter3, like=filter1)
+    filter4 = pad_like(filter4, like=filter2)
+    bandpass_filters = torch.stack([
+        torch.tensor(filter1.astype(np.float64)),
+        torch.tensor(filter2.astype(np.float64)),
+        torch.tensor(filter3.astype(np.float64)),
+        torch.tensor(filter4.astype(np.float64)),
+        ])
+    np.set_printoptions(precision=64, suppress=True)
+    return bandpass_filters
+
+
 class AdaptiveAugmentation(nn.Module):
     def __init__(self, target_rt: float = 0.6, speed: float = 2e-3, p: float = 0.0):
         super(AdaptiveAugmentation, self).__init__()
@@ -278,16 +319,9 @@ class AdaptiveAugmentation(nn.Module):
         self.target_rt = target_rt
         self.speed = speed
         self.halfnorm = distributions.half_normal.HalfNormal(0.1 ** 2)
-        self.cutout = augmentation.RandomErasing(p=1.0, scale=(0.2, 0.25), ratio=(0.8, 1/0.8))
-        # self.dwt = DWTForward(wave="sym2", mode="reflect")
-        # self.idwt = DWTInverse(wave="sym2", mode="reflect")
 
-    # def upsample(self, img: torch.Tensor):
-    #     yl, yh = self.dwt(img)  # [B, C, H, W]
-
-    def set_p(self, r: float, nimg: int):
-        self.p += nimg * (r - self.target_rt) * self.speed / 1000
-        self.p = np.clip(self.p, a_min=0.0, a_max=1.0)
+        self.dwt = DWTForward(wave="sym2", mode="reflect")
+        self.iwt = DWTInverse(wave="sym2", mode="reflect")
 
     def forward(self, *input: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         return self.augmentation(*input)
@@ -300,62 +334,61 @@ class AdaptiveAugmentation(nn.Module):
 
         with torch.no_grad():
             # x-flip
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
             i = torch.tensor(random.choices([0., 1.], k=B), device=device, dtype=dtype)
-            i[is_valid] = 0.
+            i[is_not_valid] = 0.
             G_inv = scale2d_inv(G_inv, s=(1 - 2 * i, torch.ones((B, ), device=device)))
 
             # pi/2 rot
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
-            i = torch.tensor(random.choices([0., 1.], k=B), device=device, dtype=dtype)
-            i[is_valid] = 0.
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            i = torch.tensor(random.choices([0., 1., 2., 3.], k=B), device=device, dtype=dtype)
+            i[is_not_valid] = 0.
             G_inv = rotate2d_inv(G_inv, theta=math.pi / 2 * i)
 
             # integer translation
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
             t_x = uniform(size=(B, ), range=(-0.125, 0.125), device=device)
             t_y = uniform(size=(B, ), range=(-0.125, 0.125), device=device)
-            t_x[is_valid], t_y[is_valid] = 0., 0.
-            G_inv = translate2d_inv(G_inv, t=(torch.round(t_x * W), torch.round(t_y * H)))
+            t_x[is_not_valid], t_y[is_not_valid] = 0., 0.
+            G_inv = translate2d_inv(G_inv, t=(torch.round(t_x * H), torch.round(t_y * W)))
 
             # isotropic scaling
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
             s = torch.tensor(
                 np.random.lognormal(size=(B, ), sigma=(0.2 * math.log(2)) ** 2),
                 dtype=dtype,
                 device=device)
-            s[is_valid] = 1.
+            s[is_not_valid] = 1.
             G_inv = scale2d_inv(G_inv, s=(s, s))
 
             p_rot = 1 - math.sqrt(1 - self.p)
             # before anisotropic scaling
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - p_rot
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - p_rot
             theta = uniform(size=(B, ), range=(-math.pi, math.pi), device=device, dtype=dtype)
-            theta[is_valid] = 0.
+            theta[is_not_valid] = 0.
             G_inv = rotate2d_inv(G_inv, theta=theta)
             # anisotropic scaling
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
             s = torch.tensor(
                 np.random.lognormal(size=(B, ), sigma=(0.2 * math.log(2)) ** 2),
                 dtype=dtype,
                 device=device)
-            s[is_valid] = 1.
+            s[is_not_valid] = 1.
             G_inv = scale2d_inv(G_inv, s=(s, 1 / s))
             # after anisotropic scaling
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - p_rot
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - p_rot
             theta = uniform(size=(B, ), range=(-math.pi, math.pi), device=device, dtype=dtype)
-            theta[is_valid] = 0.
+            theta[is_not_valid] = 0.
             G_inv = rotate2d_inv(G_inv, theta=theta)
 
             # fractional translation
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
             t_x = torch.normal(mean=0.0, std=0.125 ** 2, size=(B, ), device=device, dtype=dtype)
             t_y = torch.normal(mean=0.0, std=0.125 ** 2, size=(B, ), device=device, dtype=dtype)
-            t_x[is_valid], t_y[is_valid] = 0., 0.
-            G_inv = translate2d_inv(G_inv, t=(t_x, t_y))
+            t_x[is_not_valid], t_y[is_not_valid] = 0., 0.
+            G_inv = translate2d_inv(G_inv, t=(t_x * H, t_y * W))
 
-            width, height = x[0].shape[-2:]
-            cx, cy = width / 2, height / 2
+            cx, cy = H / 2, W / 2
             G_inv = translate2d_inv(
                 G_inv,
                 t=(torch.tensor([cx - 1/2,], device=device, dtype=dtype).expand(B),
@@ -376,49 +409,51 @@ class AdaptiveAugmentation(nn.Module):
         x = tuple(F.interpolate(_x, scale_factor=(2, 2)) for _x in x)
         x = tuple(geometry.warp_affine(
             _x, G_inv[:, :2],
-            dsize=(2 * height, 2 * width),
-            padding_mode="reflection") for _x in x)
+            dsize=(2 * H, 2 * W),
+            padding_mode="reflection",
+            align_corners=False) for _x in x)
         x = tuple(F.avg_pool2d(_x, kernel_size=(2, 2)) for _x in x)
 
         with torch.no_grad():
             C = torch.eye(n=4, device=device, dtype=dtype).repeat(B, 1, 1)
 
             # brightness
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
             b = torch.normal(mean=0.0, std=0.2 ** 2, size=(B, ), device=device)
-            b[is_valid] = 0.
+            b[is_not_valid] = 0.
             C = translate3d(C, t=(b, b, b))
 
             # contrast
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
             c = torch.tensor(
-                np.random.lognormal(size=(B, ), sigma=(0.2 * math.log(2)) ** 2),
+                np.random.lognormal(size=(B, ), sigma=(0.5 * math.log(2)) ** 2),
                 dtype=dtype,
                 device=device)
-            c[is_valid] = 1.
+            c[is_not_valid] = 1.
             C = scale3d(C, s=(c, c, c))
 
-            v = torch.tensor([[1., 1., 1., 0.]], device=device, dtype=dtype) / math.sqrt(3)
+            rt3 = math.sqrt(3)
+            v = torch.tensor([[1. / rt3, 1. / rt3, 1. / rt3, 0.]], device=device, dtype=dtype)
             vTv = (v.T * v).expand(B, 4, 4)
             # luma flip
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
             i = torch.tensor(random.choices([0., 1.], k=B), device=device, dtype=dtype)[:, None, None]
-            i[is_valid] = 0.
+            i[is_not_valid] = 0.
             C = (torch.eye(n=4, device=device, dtype=dtype).repeat(B, 1, 1) - 2 * vTv * i).bmm(C)
 
             # hue rotation
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
             theta = uniform(size=(B,), range=(-math.pi, math.pi), device=device, dtype=dtype)
-            theta[is_valid] = 0.
+            theta[is_not_valid] = 0.
             C = rotate3d(C, theta=theta, axis=v.expand(B, 4))
 
             # saturation rotation
-            is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+            is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
             s = torch.tensor(
-                np.random.lognormal(size=(B, ), sigma=(0.2 * math.log(2)) ** 2),
+                np.random.lognormal(size=(B, ), sigma=math.log(2) ** 2),
                 dtype=dtype,
                 device=device)[:, None, None]
-            s[is_valid] = 1.
+            s[is_not_valid] = 1.
             C = (vTv + (torch.eye(n=4, device=device, dtype=dtype).repeat(B, 1, 1) - vTv) * s).bmm(C)
 
         a_channel = torch.ones((B, 1, H, W), device=device, dtype=dtype)
@@ -426,43 +461,54 @@ class AdaptiveAugmentation(nn.Module):
         x = tuple(C.bmm(_x.reshape(B, 4, -1)).reshape(B, 4, H, W) for _x in x)  # [B, C, H, W]
         x = tuple(_x[:, :3] for _x in x)
 
-        # if random.uniform(0., 1.) < 1 - self.p:  # band pass
-        # g = torch.ones(B, 4, dtype=x.dtype, device=device)
-        # lamb = torch.tensor([[10. / 13, 1. / 13, 1. / 13, 1 / 13]], dtype=x.dtype, device=device)
-        # t = torch.tensor(
-        #     np.random.lognormal(size=(B, 4), sigma=math.log(2) ** 2),
-        #     dtype=x.dtype,
-        #     device=device)
-        # t = t / (t.square() * lamb).sum(dim=1, keepdim=True).sqrt()
-        # is_valid = torch.rand((B, ), device=device, dtype=dtype) < self.p
-        # t[is_valid] = 1.
-        # g = g * t
-        #
-        # yl: torch.Tensor
-        # yh: List[torch.Tensor]
-        # yl, yh = self.dwt(y)
-        # y = torch.cat((yl.unsqueeze(2), yh[0]), dim=2)  # [B, C, 4, H', W']
-        # y = y * g[:, None, :, None, None]
-        # yl, yh = torch.split(y, split_size_or_sections=(1, 3), dim=2)
-        # y = self.idwt((yl.squeeze(2), (yh,)))
+        # band pass
+        g = torch.ones(B, 4, dtype=dtype, device=device)
+        lamb = torch.tensor(
+            [[10. / 13, 1. / 13, 1. / 13, 1 / 13]],
+            dtype=dtype, device=device)
+        with torch.no_grad():
+            for idx in range(4):
+                t = torch.ones(B, 4, dtype=dtype, device=device)
+                t[:, idx] = torch.tensor(
+                    np.random.lognormal(size=(B,), sigma=math.log(2) ** 2),
+                    dtype=dtype,
+                    device=device)
+                is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+                t[is_not_valid, idx] = 1.
+                t = t / (t.square() * lamb).sum(dim=1, keepdim=True).sqrt()
+                g = g * t
+
+        def amplify_bands(img: torch.Tensor, g: torch.Tensor):
+            imgl, (imgh, ) = self.dwt(img)
+            imgl = imgl * g[:, None, 0, None, None]
+            imgh = imgh * g[:, None, 1:, None, None]
+            img = self.iwt((imgl, (imgh, )))
+            return img
+
+        x = tuple(amplify_bands(_x, g) for _x in x)
 
         # additive rgb noise
-        is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
+        is_not_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
         with torch.no_grad():
             std: torch.Tensor = self.halfnorm.sample(sample_shape=(B,)).to(device)
             std = std[:, None, None, None].expand_as(x[0])
             noise = torch.normal(mean=0., std=std)
-        noise[is_valid] = 0.
+            noise[is_not_valid] = 0.
         x = tuple(_x + noise for _x in x)
 
         # cutout
-        is_valid = torch.rand((B, ), device=device, dtype=dtype) < 1 - self.p
-        filter = self.cutout(torch.ones_like(x[0]))
-        filter[is_valid] = 1.
-        x = tuple(_x * filter for _x in x)
+        def cutout(img: torch.Tensor):
+            for b in range(B):
+                cx, cy = [random.uniform(0., 1.) for _ in range(2)]
+                if random.uniform(0, 1) < 1 - self.p:
+                    continue
+                img[b, :,
+                    max(int(np.round((cx - 0.25) * H)), 0): min(int(np.round((cx + 0.25) * H)), H),
+                    max(int(np.round((cy - 0.25) * W)), 0): min(int(np.round((cy + 0.25) * W)), W)] = 0.
+            return img
+        x = tuple(cutout(_x) for _x in x)
 
         return x
-
 
 
 def scale2d(input: torch.Tensor, s: Tuple[torch.Tensor, torch.Tensor], from_right: bool = False) -> torch.Tensor:

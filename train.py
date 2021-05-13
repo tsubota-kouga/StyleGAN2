@@ -9,7 +9,8 @@ from typing import Final, Optional
 
 import numpy as np
 import torch
-from torch import backends, cuda, nn, optim
+from torch import backends, cuda, nn, optim, profiler
+from torch.utils import data
 from torch.utils.tensorboard import SummaryWriter
 from torch_optimizer import AdaBelief, RAdam
 from torchvision import transforms, utils
@@ -30,12 +31,10 @@ from loss import (
     RelativisticAverageHingeGeneratorLoss,
     WGANgpDiscriminatorLoss,
     WGANgpGeneratorLoss,
-    # r1_regularization,
 )
 from network import DiscriminatorV2, GeneratorV2, LatentLayers
 from utils import (
     AdaptiveAugmentation,
-    CelebAHQDataset,
     FFHQDataset,
     adjust_dynamic_range,
     load_generator,
@@ -45,7 +44,6 @@ from utils import (
 
 
 if __name__ == "__main__":
-    # torch.autograd.set_detect_anomaly(True)
     backends.cudnn.benchmark = True
     parser = argparse.ArgumentParser()
     parser.add_argument("--preprocess", help="execute preprocess", action="store_true")
@@ -58,14 +56,14 @@ if __name__ == "__main__":
 
     dataset = FFHQDataset(
         root=hp.dataroot,
-        multi_resolution=hp.multi_resolution,
+        multi_resolution=False,
         transform=transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ]),
         use_fp16=hp.use_fp16)
 
-    dataloader = utils.data.DataLoader(
+    dataloader = data.DataLoader(
         dataset,
         batch_size=hp.batch_sizeD,
         shuffle=True,
@@ -82,7 +80,9 @@ if __name__ == "__main__":
         projection_dim=hp.projection_dim,
         minibatch_stddev_groups_size=hp.minibatch_stddev_groups_size,
         mode=hp.Dmode,
-        eps=hp.eps).to(hp.device, non_blocking=hp.non_blocking)
+        eps=hp.eps,
+        use_fp16=hp.use_fp16
+        ).to(hp.device, non_blocking=hp.non_blocking)
     discriminator.train()
 
     style_mapper = LatentLayers(
@@ -107,6 +107,7 @@ if __name__ == "__main__":
         use_scale=hp.use_scaleG,
         noise_mode=hp.noise_mode,
         mode=hp.Gmode,
+        use_fp16=hp.use_fp16,
         ).to(hp.device, non_blocking=hp.non_blocking)
     generator.train()
 
@@ -126,6 +127,15 @@ if __name__ == "__main__":
                 discriminator,
                 path=args.path)
 
+    path_length_regularization = PathLengthRegularization(
+            batch_size=hp.regularize_batch_sizeG,
+            eps=hp.eps,
+            pl_param=hp.path_length_param).to(hp.device)
+    r1_regularization = R1Regularization(
+            batch_size=hp.regularize_batch_sizeD,
+            eps=hp.eps,
+            resolution=hp.resolution,
+            use_contrastive_discriminator=hp.use_contrastive_discriminator)
 
     criterionG: nn.Module
     criterionD: nn.Module
@@ -134,54 +144,46 @@ if __name__ == "__main__":
         criterionG = GANGeneratorLoss()
         criterionD = GANDiscriminatorLoss(
             gp_param=hp.gp_param,
-            multi_resolution=hp.multi_resolution,
             eps=hp.eps)
     elif hp.gan_loss == "wgangp":
         criterionG = WGANgpGeneratorLoss()
         criterionD = WGANgpDiscriminatorLoss(
             gp_param=hp.gp_param,
             drift_param=hp.drift_param,
-            multi_resolution=hp.multi_resolution,
             eps=hp.eps)
     elif hp.gan_loss == "lsgan":
         criterionG = LSGANGeneratorLoss()
         criterionD = LSGANDiscriminatorLoss(
             gp_param=hp.gp_param,
             drift_param=hp.drift_param,
-            multi_resolution=hp.multi_resolution,
             eps=hp.eps)
     elif hp.gan_loss == "relativistic_hinge":
         criterionG = RelativisticAverageHingeGeneratorLoss()
         criterionD = RelativisticAverageHingeDiscriminatorLoss(
             gp_param=hp.gp_param,
             drift_param=hp.drift_param,
-            multi_resolution=hp.multi_resolution,
             eps=hp.eps)
     elif hp.gan_loss == "non-saturating":
         criterionG = NonSaturatingGeneratorLoss(
             use_unet_decoder=hp.use_unet_decoder,
             use_contrastive_discriminator=hp.use_contrastive_discriminator,
+            path_length_criterion=path_length_regularization if hp.regularize_with_main_loss else None,
+            path_length_per=hp.path_length_per if hp.regularize_with_main_loss else None,
+            path_length_param=hp.path_length_param if hp.regularize_with_main_loss else None,
             resolution=hp.resolution)
         criterionD = NonSaturatingDiscriminatorLoss(
             gp_param=hp.gp_param,
             drift_param=hp.drift_param,
-            r1_param=hp.r1_param,
-            r1_per=hp.r1_per,
+            r1_per=hp.r1_per if hp.regularize_with_main_loss else None,
+            r1_criterion=r1_regularization if hp.regularize_with_main_loss else None,
+            r1_param=hp.r1_param if hp.regularize_with_main_loss else None,
             adaptive_augmentation=data_augmentation,
             use_unet_decoder=hp.use_unet_decoder,
             use_contrastive_discriminator=hp.use_contrastive_discriminator,
             resolution=hp.resolution,
-            multi_resolution=hp.multi_resolution,
             eps=hp.eps)
     else:
         assert False
-    path_length_regularization = PathLengthRegularization(
-            eps=hp.eps,
-            pl_param=hp.pl_param).to(hp.device)
-    r1_regularization = R1Regularization(
-            eps=hp.eps,
-            resolution=hp.resolution,
-            use_contrastive_discriminator=hp.use_contrastive_discriminator)
 
     optimizerSM: optim.Optimizer
     optimizerG: optim.Optimizer
@@ -262,7 +264,7 @@ if __name__ == "__main__":
     scaler: Final[Optional[cuda.amp.GradScaler]] = \
             cuda.amp.GradScaler() if hp.use_fp16 else None
 
-    writer = SummaryWriter(log_dir="./log")
+    writer = SummaryWriter(log_dir=hp.log_dir)
 
 
     fixed_noise = torch.randn(
@@ -282,17 +284,25 @@ if __name__ == "__main__":
 
 
     lossR1_stat, lossPL_stat = 0., 0.
+    # with profiler.profile(
+    #     activities=[
+    #         profiler.ProfilerActivity.CPU,
+    #         profiler.ProfilerActivity.CUDA ],
+    #     schedule=torch.profiler.schedule(wait=1, warmup=1, active=2),
+    #     on_trace_ready=profiler.tensorboard_trace_handler(hp.profile_dir)) as p:
     for epoch in trange(hp.num_epoch):
         for idx, imgs in enumerate(tqdm(dataloader)):
-            b_size = imgs.shape[0]
+            B = imgs.shape[0]
 
-            if b_size % hp.minibatch_stddev_groups_size != 0:
-                continue
+            if B % hp.minibatch_stddev_groups_size != 0:
+                if B >= hp.minibatch_stddev_groups_size:
+                    imgs = imgs[:-(B % hp.minibatch_stddev_groups_size)]
+                    B = imgs.shape[0]
 
             with cuda.amp.autocast(enabled=hp.use_fp16):
                 imgs = imgs.to(hp.device, non_blocking=hp.non_blocking).requires_grad_(True)
                 noise = torch.randn(
-                    b_size, hp.latent_dim, hp.n_mix, 1,
+                    B, hp.latent_dim, hp.n_mix, 1,
                     dtype=torch.float16 if hp.use_fp16 else torch.float32,
                     device=hp.device)
 
@@ -303,60 +313,25 @@ if __name__ == "__main__":
 
                 if hp.use_adaptive_discriminator_augmentation:
                     with cuda.amp.autocast(False):
+                        fakes_not_augmented = fakes
                         if hp.use_unet_decoder:
                             imgs, fakes = data_augmentation(imgs.float(), fakes.float())
                         else:
                             imgs, = data_augmentation(imgs.float())
                             fakes, = data_augmentation(fakes.float())
-
-            # Discriminator train
-            with cuda.amp.autocast(enabled=hp.use_fp16):
-                discriminator.train()
-                for p in discriminator.parameters():
-                    p.requires_grad = True
-
-                lossD = criterionD(discriminator, fakes.detach(), imgs.detach(), scaler)
-
-                if type(lossD) is tuple:
-                    lossD = sum(lossD)
-                discriminator.zero_grad(set_to_none=True)
-
-                if scaler is not None:  # hp.use_fp16
-                    scaler.scale(lossD).backward()
-                    scaler.step(optimizerD)
-                    scaler.update()
                 else:
-                    lossD.backward()
-                    optimizerD.step()
-                lossD_item = lossD.item()
-                del lossD
-                cuda.synchronize(hp.device)
-
-                if global_step % hp.r1_per == 0:
-                    lossR1 = hp.r1_param * r1_regularization(
-                            imgs,
-                            discriminator=discriminator,
-                            scaler=scaler)
-                    discriminator.zero_grad(set_to_none=True)
-                    if scaler is not None:  # hp.use_fp16
-                        scaler.scale(lossR1).backward()
-                        scaler.step(optimizerD)
-                        scaler.update()
-                    else:
-                        lossR1.backward()
-                        optimizerD.step()
-                    lossR1_item = lossR1.item()
-                    del lossR1
-                    cuda.synchronize(hp.device)
-                    lossR1_stat = lossR1_item
-
-                lossD = lossD_item
-                cuda.empty_cache()
+                    fakes_not_augmented = None
 
             # Generator train
             with cuda.amp.autocast(enabled=hp.use_fp16):
                 discriminator.eval()
-                lossG = criterionG(discriminator, fakes=fakes, reals=imgs)
+                lossG = criterionG(
+                        discriminator,
+                        fakes=fakes,
+                        reals=imgs,
+                        fakes_not_augmented=fakes_not_augmented if fakes_not_augmented is not None else fakes,
+                        latents=styles,
+                        scaler=scaler)
                 style_mapper.zero_grad(set_to_none=True)
                 generator.zero_grad(set_to_none=True)
 
@@ -377,16 +352,17 @@ if __name__ == "__main__":
                 del lossG
                 cuda.synchronize(hp.device)
 
-                if global_step % hp.path_length_per == 0:
+                # PathLengthRegularization
+                if not hp.regularize_with_main_loss and global_step % hp.path_length_per == 1:
                     noise = torch.randn(
-                        b_size, hp.latent_dim, hp.n_mix, 1,
+                        B, hp.latent_dim, hp.n_mix, 1,
                         dtype=torch.float16 if hp.use_fp16 else torch.float32,
                         device=hp.device)
                     styles = style_mapper(noise, mixing_regularization_rate=hp.n_mix)
                     fakes = generator(styles=styles)[-1]
-                    lossPL = path_length_regularization(
+                    lossPL = hp.path_length_param * hp.path_length_per * path_length_regularization(
                             fakes=fakes,
-                            latent=styles,
+                            latents=styles,
                             scaler=scaler)
 
                     generator.zero_grad(set_to_none=True)
@@ -404,6 +380,58 @@ if __name__ == "__main__":
                     lossPL_stat = lossPL_item
                 lossG = lossG_item
                 cuda.empty_cache()
+                tmp = fakes.detach().clone()
+                del fakes
+                fakes = tmp
+
+            # Discriminator train
+            with cuda.amp.autocast(enabled=hp.use_fp16):
+                discriminator.train()
+                for param in discriminator.parameters():
+                    param.requires_grad = True
+
+                lossD = criterionD(
+                        discriminator,
+                        fakes=fakes.detach(),
+                        reals=imgs.detach().requires_grad_(),
+                        scaler=scaler)
+
+                if type(lossD) is tuple:
+                    lossD = sum(lossD)
+                discriminator.zero_grad(set_to_none=True)
+
+                if scaler is not None:  # hp.use_fp16
+                    scaler.scale(lossD).backward()
+                    scaler.step(optimizerD)
+                    scaler.update()
+                else:
+                    lossD.backward()
+                    optimizerD.step()
+                lossD_item = lossD.item()
+                del lossD
+                cuda.synchronize(hp.device)
+
+                # R1Regularization
+                if not hp.regularize_with_main_loss and global_step % hp.r1_per == 1:
+                    lossR1 = hp.r1_param * hp.r1_per * r1_regularization(
+                            imgs,
+                            discriminator=discriminator,
+                            scaler=scaler)
+                    discriminator.zero_grad(set_to_none=True)
+                    if scaler is not None:  # hp.use_fp16
+                        scaler.scale(lossR1).backward()
+                        scaler.step(optimizerD)
+                        scaler.update()
+                    else:
+                        lossR1.backward()
+                        optimizerD.step()
+                    lossR1_item = lossR1.item()
+                    del lossR1
+                    cuda.synchronize(hp.device)
+                    lossR1_stat = lossR1_item
+
+                lossD = lossD_item
+                cuda.empty_cache()
 
             # LOG
             def evaluate():
@@ -414,17 +442,18 @@ if __name__ == "__main__":
                     lossD,
                     global_step)
                 writer.add_scalar(
-                    "discriminator R1",
-                    lossR1_stat,
-                    global_step)
-                writer.add_scalar(
                     "generator loss",
                     lossG,
                     global_step)
-                writer.add_scalar(
-                    "generator PL",
-                    lossPL_stat,
-                    global_step)
+                if not hp.regularize_with_main_loss:
+                    writer.add_scalar(
+                        "discriminator R1",
+                        lossR1_stat,
+                        global_step)
+                    writer.add_scalar(
+                        "generator PL",
+                        lossPL_stat,
+                        global_step)
                 if hp.use_adaptive_discriminator_augmentation:
                     writer.add_scalar(
                         "data_augmentation p",
@@ -445,6 +474,14 @@ if __name__ == "__main__":
                         if hp.use_unet_decoder:
                             _, fake_unet_out = discriminator(fakes[-1], unet_out=True)
                     fakes = [ adjust_dynamic_range(fake.float()) for fake in fakes ]
+                    writer.add_image(
+                        f"real img",
+                        utils.make_grid(
+                            imgs,
+                            nrow=4,
+                            padding=1,
+                            normalize=True),
+                        global_step)
                     for idx, fake in enumerate(fakes):
                         fake = fake.detach().cpu()
                         if hp.Gmode == "wavelet":
@@ -461,7 +498,7 @@ if __name__ == "__main__":
                             global_step)
                     if hp.use_unet_decoder:
                         writer.add_image(
-                            f"unet out imgs {size}x{size}",
+                            f"unet out imgs",
                             utils.make_grid(
                                 torch.sigmoid(fake_unet_out),
                                 padding=1, nrow=4, normalize=False, range=(0, 1)),
@@ -482,7 +519,8 @@ if __name__ == "__main__":
                     "optimizerD": optimizerD.state_dict(),
                     "optimizerSM": optimizerSM.state_dict(),
                     "path_length_regularization": path_length_regularization.state_dict(),
-                }, f"./model/{t}.model")
+                }, os.path.join(hp.model_dir, f"{t}.model"))
             global_step += 1
+            # p.step()
 
     writer.close()

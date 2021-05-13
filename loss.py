@@ -70,39 +70,43 @@ def _gradiend_penalty_for_multi_scale(
     return grad_penalty_loss
 
 
-def gradiend_penalty(discriminator, fakes, reals, scaler, multi_resolution: bool, eps: Optional[float] = None):
-    if not multi_resolution:
-        return _gradiend_penalty(discriminator, fakes, reals, eps, scaler)
-    else:
-        return _gradiend_penalty_for_multi_scale(discriminator, fakes, reals, eps, scaler)
+def gradiend_penalty(discriminator, fakes, reals, scaler, eps: Optional[float] = None):
+    return _gradiend_penalty(discriminator, fakes, reals, eps, scaler)
 
 
 class R1Regularization(nn.Module):
     def __init__(self,
+                 batch_size: int,
                  eps: Optional[float] = None,
                  resolution: Optional[int] = None,
                  use_contrastive_discriminator: bool = False):
         super(R1Regularization, self).__init__()
+        self.batch_size = batch_size
         self.eps = eps
+        self.use_contrastive_discriminator = use_contrastive_discriminator
         if use_contrastive_discriminator:
             assert resolution is not None
             self.transform = SimCLRAugmentation(resolution=resolution)
 
     def forward(self,
-                reals: torch.Tensor, *,
-                discriminator: nn.Module,
+                reals: torch.Tensor,
+                discriminator: Optional[nn.Module] = None,
                 reals_out: Optional[torch.Tensor] = None,
                 scaler: Optional[cuda.amp.GradScaler] = None) -> torch.Tensor:
-
-        if reals_out is None:  # re-compute
-            reals_out = discriminator(reals, r1_regularize=True)
+        '''
+        NOTE: if reals_out is not None (do NOT re-compute), batch_size is same as reals.
+        '''
+        if reals_out is None or self.use_contrastive_discriminator:  # re-compute
+            reals = reals[:self.batch_size]
+            reals_out, feature = discriminator(reals, r1_regularize=True)
 
         if scaler is not None:
             reals_out = scaler.scale(reals_out)
             inv_scale = 1. / (scaler.get_scale() + self.eps)
         grad = autograd.grad(
             outputs=reals_out.sum(),
-            inputs=reals,
+            inputs=reals.requires_grad_(True)
+                if not self.use_contrastive_discriminator else feature,
             create_graph=True)[0]
         if scaler is not None:
             grad = grad * inv_scale
@@ -135,19 +139,22 @@ def r1_regularization(
 
 class PathLengthRegularization(nn.Module):
     def __init__(self,
-                 eps: float,
+                 batch_size: int,
+                 eps: Optional[float] = None,
                  coefficient: float = 0.99,
                  pl_param: Optional[float] = None):
         super(PathLengthRegularization, self).__init__()
         self.register_buffer("moving_average", torch.zeros([1]))
+        self.batch_size = batch_size
         self.coefficient = coefficient
         self.eps = eps
         self.pl_param = pl_param
 
     def forward(self,
                 fakes: torch.Tensor,
-                latent: List[torch.Tensor],
+                latents: List[torch.Tensor],
                 scaler: Optional[cuda.amp.GradScaler] = None) -> torch.Tensor:
+        fakes = fakes[:self.batch_size]
         noise = torch.randn_like(fakes) / math.sqrt(math.prod(fakes.shape[-2:]))
         outputs = (noise * fakes).sum()
 
@@ -162,33 +169,29 @@ class PathLengthRegularization(nn.Module):
             inv_scale = 1. / (scaler.get_scale() + self.eps)
         grad = autograd.grad(
                 outputs=outputs,
-                inputs=latent,
+                inputs=latents,
                 create_graph=True)[0]
         if scaler is not None:
             grad = grad * inv_scale
-        path_length = grad.square().sum(dim=2).mean(dim=1).sqrt()
+        path_length = grad.square().sum(dim=1).mean().sqrt()
         penalty = (self.moving_average - path_length).square().mean()
-        self.moving_average.data = (
-                path_length.mean() * (1 - self.coefficient) +
-                self.moving_average * self.coefficient)
+        if not path_length.isnan().any():
+            self.moving_average.data = (
+                    path_length.mean() * (1 - self.coefficient) +
+                    self.moving_average * self.coefficient)
         return penalty * pl_param
 
 
 class GANDiscriminatorLoss(nn.Module):
-    def __init__(self, gp_param: Optional[float], eps: Optional[float] = None, multi_resolution: bool = False):
+    def __init__(self, gp_param: Optional[float], eps: Optional[float] = None):
         super(GANDiscriminatorLoss, self).__init__()
         self.criterion = nn.BCELoss()
         self.gp_param = gp_param
-        self.multi_resolution = multi_resolution
         self.eps = eps
 
     def forward(self, discriminator: nn.Module, fakes, reals, scaler=None):
-        if not self.multi_resolution:
-            batch_size = reals.shape[0]
-            labels = torch.full((batch_size, ), 1.0).to(reals.device)
-        else:
-            batch_size = reals[0].shape[0]
-            labels = torch.full((batch_size, ), 1.0).to(reals[0].device)
+        batch_size = reals.shape[0]
+        labels = torch.full((batch_size, ), 1.0).to(reals.device)
         reals_out = discriminator(reals).view(-1)
         lossD = self.criterion(reals_out, labels)
         if self.gp_param is not None:
@@ -196,7 +199,6 @@ class GANDiscriminatorLoss(nn.Module):
                 discriminator=discriminator,
                 fakes=fakes, reals=reals,
                 scaler=scaler,
-                multi_resolution=self.multi_resolution,
                 eps=self.eps)
         else:
             grad_penalty_loss = 0.0
@@ -215,12 +217,10 @@ class WGANgpDiscriminatorLoss(nn.Module):
     def __init__(self,
                  gp_param: Optional[float],
                  drift_param: Optional[float],
-                 eps: Optional[float] = None,
-                 multi_resolution: bool = False):
+                 eps: Optional[float] = None):
         super(WGANgpDiscriminatorLoss, self).__init__()
         self.gp_param = gp_param
         self.drift_param = drift_param
-        self.multi_resolution = multi_resolution
         self.eps = eps
 
     def forward(self,
@@ -238,7 +238,6 @@ class WGANgpDiscriminatorLoss(nn.Module):
                 fakes=fakes,
                 reals=reals,
                 scaler=scaler,
-                multi_resolution=self.multi_resolution,
                 eps=self.eps)
         else:
             grad_penalty_loss = 0.0
@@ -268,15 +267,13 @@ class LSGANDiscriminatorLoss(nn.Module):
                  gp_param: Optional[float],
                  drift_param: Optional[float],
                  a: float = 0.0, b: float = 1.0,
-                 eps: Optional[float] = None,
-                 multi_resolution: bool = False):
+                 eps: Optional[float] = None):
         super(LSGANDiscriminatorLoss, self).__init__()
         self.gp_param = gp_param
         self.drift_param = drift_param
         self.a = a
         self.b = b
         self.eps = eps
-        self.multi_resolution = multi_resolution
 
     def forward(self,
                 discriminator: nn.Module,
@@ -293,7 +290,6 @@ class LSGANDiscriminatorLoss(nn.Module):
                 fakes=fakes,
                 reals=reals,
                 scaler=scaler,
-                multi_resolution=self.multi_resolution,
                 eps=self.eps)
         else:
             grad_penalty_loss = 0.0
@@ -323,13 +319,11 @@ class RelativisticAverageHingeDiscriminatorLoss(nn.Module):
     def __init__(self,
                  gp_param: Optional[float] = None,
                  drift_param: Optional[float] = None,
-                 eps: Optional[float] = None,
-                 multi_resolution: bool = False):
+                 eps: Optional[float] = None):
         super(RelativisticAverageHingeDiscriminatorLoss, self).__init__()
         self.gp_param = gp_param
         self.drift_param = drift_param
         self.eps = eps
-        self.multi_resolution = multi_resolution
 
     def forward(self,
                 discriminator: nn.Module,
@@ -344,7 +338,6 @@ class RelativisticAverageHingeDiscriminatorLoss(nn.Module):
                 fakes=fakes,
                 reals=reals,
                 scaler=scaler,
-                multi_resolution=self.multi_resolution,
                 eps=self.eps)
         else:
             grad_penalty_loss = 0.0
@@ -369,7 +362,7 @@ class RelativisticAverageHingeGeneratorLoss(nn.Module):
 
 
 class ContrastiveDiscriminatorLoss(nn.Module):
-    def __init__(self, tau: float = 0.1, eps=1e-8):
+    def __init__(self, tau: float = 0.1, eps=1e-12):
         super(ContrastiveDiscriminatorLoss, self).__init__()
         self.tau = tau
         self.eps = eps
@@ -383,9 +376,9 @@ class ContrastiveDiscriminatorLoss(nn.Module):
         device = vr1.device
         x = torch.cat((vr1, vr2), dim=0)
         x = self.cosine_cdist(x, x)
-        mask = torch.eye(n=2 * N, device=device) == 1
-        x = -torch.log_softmax(x.masked_fill(mask=mask, value=-math.inf), dim=0)  # [2N, 2N]
-        loss = (torch.einsum('ii', x[N:, :N]) + torch.einsum('ii', x[:N, N:])) / (2 * N)
+        mask_diag = torch.eye(n=2 * N, dtype=torch.bool, device=device)
+        x = -torch.log_softmax(x.masked_fill(mask=mask_diag, value=-math.inf), dim=0)  # [2N, 2N]
+        loss = (x[N:, :N].trace() + x[:N, N:].trace()) / (2 * N)
         return loss
 
     def negative(self, vr1: torch.Tensor, vr2: torch.Tensor, vf: torch.Tensor) -> torch.Tensor:
@@ -398,9 +391,9 @@ class ContrastiveDiscriminatorLoss(nn.Module):
         x = vf
         y = torch.cat((vf, vr1, vr2), dim=0)
         d = self.cosine_cdist(x, y)
-        mask = torch.eye(n=N, m=3 * N, device=device) == 1
-        d = -torch.log_softmax(d.masked_fill(mask=mask, value=-math.inf), dim=1)  # [N, 3N]
-        loss = d.masked_fill(mask=mask, value=0)[:N, :N].sum() / (N * (N - 1))
+        mask_diag = torch.eye(n=N, m=3 * N, dtype=torch.bool, device=device)
+        d = -torch.log_softmax(d.masked_fill(mask=mask_diag, value=-math.inf), dim=1)  # [N, 3N]
+        loss = d.masked_fill(mask=mask_diag, value=0)[:N, :N].sum() / (N * (N - 1))
         return loss
 
     def forward(self,
@@ -417,26 +410,44 @@ class ContrastiveDiscriminatorLoss(nn.Module):
         Returns:
             [N1, N2]
         '''
-        x, y = F.normalize(x, eps=self.eps).unsqueeze(1), F.normalize(y, eps=self.eps).unsqueeze(0)
-        return (x * y).sum(dim=2) / self.tau
+        x, y = F.normalize(x, eps=self.eps), F.normalize(y, eps=self.eps)
+        return torch.einsum("nc,mc->nm", x, y) / self.tau
 
 
 class NonSaturatingGeneratorLoss(nn.Module):
     def __init__(self,
                  use_unet_decoder: bool = False,
                  use_contrastive_discriminator: bool = False,
+                 path_length_criterion: Optional[PathLengthRegularization] = None,
+                 path_length_per: Optional[int] = None,
+                 path_length_param: Optional[float] = None,
                  resolution: Optional[int] = None):
         super(NonSaturatingGeneratorLoss, self).__init__()
         self.use_unet_decoder = use_unet_decoder
         self.use_contrastive_discriminator = use_contrastive_discriminator
+
+        assert (path_length_criterion is None) == (path_length_per is None) == (path_length_param is None)
+        self.path_length_criterion = path_length_criterion
+        self.path_length_per = path_length_per
+        self.path_length_param = path_length_param
+
+        self.cnt = 0
+
         if use_contrastive_discriminator:
             assert resolution is not None
             self.transform = SimCLRAugmentation(resolution)
 
+    def is_next_pl(self):
+        return self.path_length_per is not None and (self.cnt + 1) % self.path_length_per == 0
+
     def forward(self,
                 discriminator: nn.Module,
                 fakes: Union[torch.Tensor, List[torch.Tensor]],
-                reals: Union[torch.Tensor, List[torch.Tensor]]) -> torch.Tensor:
+                reals: Union[torch.Tensor, List[torch.Tensor]],
+                fakes_not_augmented: Optional[torch.Tensor] = None,
+                latents: Optional[List[torch.Tensor]] = None,
+                scaler: Optional[cuda.amp.GradScaler] = None) -> torch.Tensor:
+        self.cnt += 1
         if self.use_contrastive_discriminator:
             fakes = self.transform(fakes)
         fakes_out, fakes_unet_out = discriminator(
@@ -446,6 +457,10 @@ class NonSaturatingGeneratorLoss(nn.Module):
         loss = F.softplus(-fakes_out).mean()
         if self.use_unet_decoder:
             loss += F.softplus(-fakes_unet_out).mean()
+        if self.is_next_pl():
+            path_length_per = self.path_length_per or 1.
+            loss += self.path_length_param * path_length_per * self.path_length_criterion(
+                    fakes=fakes_not_augmented, latents=latents, scaler=scaler)
         return loss
 
 
@@ -454,24 +469,30 @@ class NonSaturatingDiscriminatorLoss(nn.Module):
                  gp_param: Optional[float] = None,
                  drift_param: Optional[float] = None,
                  r1_param: Optional[float] = None,
+                 r1_criterion: Optional[R1Regularization] = None,
+                 r1_per: Optional[int] = None,
                  eps: Optional[float] = None,
-                 multi_resolution: bool = False,
                  adaptive_augmentation: Optional[AdaptiveAugmentation] = None,
                  use_unet_decoder: bool = False,
                  use_contrastive_discriminator: bool = False,
                  resolution: Optional[int] = None,
-                 r1_per: Optional[int] = None,
                  set_p_per: int = 4):
         super(NonSaturatingDiscriminatorLoss, self).__init__()
         self.gp_param = gp_param
         self.drift_param = drift_param
+
+        assert (r1_criterion is None) == (r1_param is None) == (r1_per is None)
+        self.r1_criterion = r1_criterion
+        self.r1_param = r1_param
+        self.r1_per = r1_per
+
         self.use_unet_decoder = use_unet_decoder
         self.use_contrastive_discriminator = use_contrastive_discriminator
         self.set_p_per = set_p_per
+        self.rt_buffer = []
         self.cnt = 0
         self.eps = eps
         self.rt = 0.
-        self.multi_resolution = multi_resolution
         self.loss = nn.LogSigmoid()
         self.adaptive_augmentation = adaptive_augmentation
 
@@ -482,6 +503,9 @@ class NonSaturatingDiscriminatorLoss(nn.Module):
 
     def is_next_set_p(self):
         return self.adaptive_augmentation is not None and (self.cnt + 1) % self.set_p_per == 0
+
+    def is_next_r1(self):
+        return self.r1_criterion is not None and (self.cnt + 1) % self.r1_per == 0
 
     def forward(self,
                 discriminator: nn.Module,
@@ -494,32 +518,38 @@ class NonSaturatingDiscriminatorLoss(nn.Module):
             vr1 = self.transform(reals).detach()
             vr2 = self.transform(reals).detach()
             vf = self.transform(fakes).detach()
-            reals_out, reals_out_unet = discriminator(
-                vr2,
-                unet_out=self.use_unet_decoder,
-                contrastive_out="discriminator")
-            fakes_out, fakes_out_unet = discriminator(
-                vf,
-                unet_out=self.use_unet_decoder,
-                contrastive_out="discriminator")
-            # vr1p = discriminator(vr1, contrastive_out="positive")
-            # vr2p = discriminator(vr2, contrastive_out="positive")
             B = vr1.shape[0]
+            feature = discriminator(
+                    torch.cat((vr1, vr2, vf)),
+                    contrastive_out="feature")
             vr1p, vr2p = discriminator(
-                    torch.cat((vr1, vr2)),
+                    feature=feature[:2 * B],
                     contrastive_out="positive").split((B, B))
-            vr1n, vr2n = discriminator(
-                    torch.cat((vr1, vr2)),
-                    contrastive_out="negative").split((B, B))
-            # vr1n = discriminator(vr1, contrastive_out="negative")
-            # vr2n = discriminator(vr2, contrastive_out="negative")
-            vfn = discriminator(vf, contrastive_out="negative")
+            vr1n, vr2n, vfn = discriminator(
+                    feature=feature,
+                    contrastive_out="negative").split((B, B, B))
             contrastive_loss = self.contrastive_discriminator_loss(
                     vr1p=vr1p, vr2p=vr2p,
                     vr1n=vr1n, vr2n=vr2n, vfn=vfn)
+            if self.use_unet_decoder:
+                reals_out, reals_out_unet = discriminator(
+                    vr2,
+                    unet_out=self.use_unet_decoder,
+                    contrastive_out="discriminator")
+                fakes_out, fakes_out_unet = discriminator(
+                    vf,
+                    unet_out=self.use_unet_decoder,
+                    contrastive_out="discriminator")
+            else:
+                reals_out, fakes_out = discriminator(
+                    feature=feature[-2 * B:].detach(),
+                    contrastive_out="discriminator").split((B, B))
         else:
-            reals_out, reals_out_unet = discriminator(reals, unet_out=self.use_unet_decoder)
-            fakes_out, fakes_out_unet = discriminator(fakes, unet_out=self.use_unet_decoder)
+            reals_out, reals_out_unet = discriminator(
+                    reals.requires_grad_(self.is_next_r1()),
+                    unet_out=self.use_unet_decoder)
+            fakes_out, fakes_out_unet = discriminator(
+                    fakes, unet_out=self.use_unet_decoder)
             contrastive_loss = 0.
 
         if self.use_unet_decoder:
@@ -535,7 +565,7 @@ class NonSaturatingDiscriminatorLoss(nn.Module):
             mixes1 = torch.lerp(fakes, reals, weight=eps)
             mix_out1, mix_out_unet1 = discriminator(mixes1, unet_out=True)
             mixes2 = torch.lerp(fakes, reals, weight=1 - eps)
-            mix_out2, mix_out_unet2 = discriminator(mixes1, unet_out=True)
+            mix_out2, mix_out_unet2 = discriminator(mixes2, unet_out=True)
 
             # mix
             mix_loss1 = F.softplus(mix_out1).mean()  # as fakes
@@ -558,7 +588,6 @@ class NonSaturatingDiscriminatorLoss(nn.Module):
                 fakes=fakes,
                 reals=reals,
                 scaler=scaler,
-                multi_resolution=self.multi_resolution,
                 eps=self.eps)
         else:
             grad_penalty_loss = 0.0
@@ -570,17 +599,45 @@ class NonSaturatingDiscriminatorLoss(nn.Module):
 
         real_loss = F.softplus(-reals_out).mean()
         fake_loss = F.softplus(fakes_out).mean()
+
+        self.rt_buffer.append(reals_out.sign().mean().item())
         if self.is_next_set_p():
-            nimg = reals_out.shape[0]
-            self.rt = reals_out.sign().mean().item()
+            B = reals_out.shape[0]
+            self.rt = sum(self.rt_buffer) / len(self.rt_buffer)
+            self.rt_buffer = []
             adjust = np.sign(self.rt - self.adaptive_augmentation.target_rt) * \
-                    nimg * self.adaptive_augmentation.speed * self.set_p_per / 1000
+                    B * self.set_p_per * self.adaptive_augmentation.speed
             self.adaptive_augmentation.p = np.clip(
                 a=self.adaptive_augmentation.p + adjust, a_min=0.0, a_max=1.0)
+
+        if self.is_next_r1():
+            r1_per = self.r1_per or 1.
+            r1_loss = self.r1_param * r1_per * self.r1_criterion(
+                    reals=reals,
+                    reals_out=reals_out,
+                    discriminator=discriminator,
+                    scaler=scaler)
+        else:
+            r1_loss = 0.
+
         return real_loss + fake_loss + mix_loss1 + mix_loss2, \
                real_unet_loss + fake_unet_loss + mix_unet_loss1 + mix_unet_loss2, \
                consistency_loss1 + consistency_loss2, \
                contrastive_loss, \
                grad_penalty_loss, \
-               drift_loss
+               drift_loss, \
+               r1_loss
+
+
+class DualContrastiveLoss(nn.Module):
+    def __init__(self):
+        super(DualContrastiveLoss).__init__()
+
+    def forward(self,
+                discriminator: nn.Module,
+                reals: torch.Tensor,
+                fakes: torch.Tensor,
+                scaler: Optional[cuda.amp.GradScaler] = None) -> torch.Tensor:
+        # TODO: Implement
+        pass
 

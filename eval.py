@@ -36,6 +36,7 @@ if __name__ == "__main__":
         use_scale=hp.use_scaleG,
         noise_mode=hp.noise_mode,
         mode=hp.Gmode,
+        use_fp16=hp.use_fp16,
         ).to(hp.device, non_blocking=hp.non_blocking)
 
     style_mapper, generator = load_generator(
