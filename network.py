@@ -9,6 +9,7 @@ from pytorch_wavelets import DWTForward, DWTInverse
 import torch
 from torch import nn, cuda
 from torch.nn import functional as F
+from utils import Up, Down
 
 
 class Print(nn.Module):
@@ -72,32 +73,6 @@ def fuse_weight(weight: torch.Tensor):
         weight[:, :-1, :-1]) / 4
     return weight
 
-
-class Up(nn.Module):
-    '''Upsample with 0'''
-    def __init__(self, scale: int = 1):
-        super(Up, self).__init__()
-        self.scale = scale
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = input.shape
-        x = F.pad(
-                input[:, :, :, None, :, None],
-                (0, self.scale - 1,
-                 0, 0,
-                 0, self.scale - 1,
-                 0, 0), mode="constant") \
-             .reshape(B, C, self.scale * H, self.scale * W)
-        return x
-
-
-class Down(nn.Module):
-    def __init__(self, scale: int = 1):
-        super(Down, self).__init__()
-        self.scale = scale
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return input[:, :, ::self.scale, ::self.scale]
 
 class UpConvDown(nn.Conv2d):
     def __init__(self, *args, up: int = 0, down: int = 0, **kwargs):

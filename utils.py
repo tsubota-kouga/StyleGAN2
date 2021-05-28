@@ -23,6 +23,33 @@ from pytorch_wavelets import DWTForward, DWTInverse
 from tqdm import tqdm
 
 
+class Up(nn.Module):
+    '''Upsample with 0'''
+    def __init__(self, scale: int = 1):
+        super(Up, self).__init__()
+        self.scale = scale
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = input.shape
+        x = F.pad(
+                input[:, :, :, None, :, None],
+                (0, self.scale - 1,
+                 0, 0,
+                 0, self.scale - 1,
+                 0, 0), mode="constant") \
+             .reshape(B, C, self.scale * H, self.scale * W)
+        return x
+
+
+class Down(nn.Module):
+    def __init__(self, scale: int = 1):
+        super(Down, self).__init__()
+        self.scale = scale
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return input[:, :, ::self.scale, ::self.scale]
+
+
 def weights_init(m):
     if type(m) is nn.Conv2d or type(m) is nn.ConvTranspose2d:
         nn.init.normal_(m.weight.data, 0.0)
@@ -241,10 +268,10 @@ def load_generator(
         print(f"load {path}")
         state = torch.load(path, map_location=lambda storage, loc: storage)
     else:
-        path = glob("model/*")
-        path = list(map(lambda p: os.path.splitext(p)[0], path))
-        path = list(map(lambda p: os.path.basename(p), path))
-        date = list(map(lambda d: datetime.datetime.fromisoformat(d), path))
+        pathlist = glob("model/*")
+        pathlist = list(map(lambda p: os.path.splitext(p)[0], pathlist))
+        pathlist = list(map(lambda p: os.path.basename(p), pathlist))
+        date = list(map(lambda d: datetime.datetime.fromisoformat(d), pathlist))
         latest = sorted(date)[-1]
         print(f"load latest {latest}")
         state = torch.load(f"model/{latest}.{ext}", map_location=lambda storage, loc: storage)
@@ -312,6 +339,46 @@ def wavelet_bandpass_filters(wt: str) -> torch.Tensor:
     return bandpass_filters
 
 
+class LowPassFilter(nn.Module):
+    def __init__(self, wt: str, up: int = 2, down: int = 1):
+        super(LowPassFilter, self).__init__()
+        self.up = Up(up)
+        self.down = Down(down)
+        filter_bank = pywt.Wavelet(wt).filter_bank
+        H_z, _, _, _ = filter_bank  # H(z), H(-z^-1), H(z^-1), H(-z)
+        self.sym6 = nn.Parameter(torch.tensor(H_z)[None, None, :])
+        self.filter_length = len(H_z)
+        self.pad = nn.ReflectionPad2d((self.filter_length - up) // 2)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        _, C, _, _ = input.shape
+        x = self.up(input)
+        x = self.pad(x)
+        x = F.conv2d(x, self.sym6[..., None, :].expand(C, -1, -1, -1), groups=C)
+        x = F.conv2d(x, self.sym6[..., :, None].expand(C, -1, -1, -1), groups=C)
+        return x
+
+
+class HighPassFilter(nn.Module):
+    def __init__(self, wt: str, up: int = 1, down: int = 2):
+        super(HighPassFilter, self).__init__()
+        self.up = Up(up)
+        self.down = Down(down)
+        filter_bank = pywt.Wavelet(wt).filter_bank
+        _, _, H_z_inv, _ = filter_bank  # H(z), H(-z^-1), H(z^-1), H(-z)
+        self.sym6 = nn.Parameter(torch.tensor(H_z_inv)[None, None, :])
+        self.filter_length = len(H_z_inv)
+        self.pad = nn.ReflectionPad2d((self.filter_length - up) // 2)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        _, C, _, _ = input.shape
+        x = self.pad(input)
+        x = F.conv2d(x, self.sym6[..., None, :].expand(C, -1, -1, -1), groups=C)
+        x = F.conv2d(x, self.sym6[..., :, None].expand(C, -1, -1, -1), groups=C)
+        x = self.down(input)
+        return x
+
+
 class AdaptiveAugmentation(nn.Module):
     def __init__(self, target_rt: float = 0.6, speed: float = 2e-3, p: float = 0.0):
         super(AdaptiveAugmentation, self).__init__()
@@ -320,8 +387,11 @@ class AdaptiveAugmentation(nn.Module):
         self.speed = speed
         self.halfnorm = distributions.half_normal.HalfNormal(0.1 ** 2)
 
-        self.dwt = DWTForward(wave="sym2", mode="reflect")
-        self.iwt = DWTInverse(wave="sym2", mode="reflect")
+        self.sym2_dwt = DWTForward(wave="sym2", mode="reflect")
+        self.sym2_iwt = DWTInverse(wave="sym2", mode="reflect")
+
+        self.sym6_low = LowPassFilter("sym6", up=2)
+        self.sym6_high = HighPassFilter("sym6", down=2)
 
     def forward(self, *input: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         return self.augmentation(*input)
@@ -406,13 +476,13 @@ class AdaptiveAugmentation(nn.Module):
                 s=(torch.tensor([2.,], device=device).expand(B),
                    torch.tensor([2.,], device=device).expand(B)))
 
-        x = tuple(F.interpolate(_x, scale_factor=(2, 2)) for _x in x)
+        x = tuple(self.sym6_low(_x) for _x in x)
         x = tuple(geometry.warp_affine(
             _x, G_inv[:, :2],
             dsize=(2 * H, 2 * W),
             padding_mode="reflection",
             align_corners=False) for _x in x)
-        x = tuple(F.avg_pool2d(_x, kernel_size=(2, 2)) for _x in x)
+        x = tuple(self.sym6_high(_x) for _x in x)
 
         with torch.no_grad():
             C = torch.eye(n=4, device=device, dtype=dtype).repeat(B, 1, 1)
@@ -479,10 +549,10 @@ class AdaptiveAugmentation(nn.Module):
                 g = g * t
 
         def amplify_bands(img: torch.Tensor, g: torch.Tensor):
-            imgl, (imgh, ) = self.dwt(img)
+            imgl, (imgh, ) = self.sym2_dwt(img)
             imgl = imgl * g[:, None, 0, None, None]
             imgh = imgh * g[:, None, 1:, None, None]
-            img = self.iwt((imgl, (imgh, )))
+            img = self.sym2_iwt((imgl, (imgh, )))
             return img
 
         x = tuple(amplify_bands(_x, g) for _x in x)

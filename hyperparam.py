@@ -12,10 +12,10 @@ class HyperParam:
     log_dir = "./log"
     profile_dir = "./profile"
     model_dir = "/mnt/My Files/stylegan-model/"
-    batch_sizeD = 32
-    batch_sizeG = 32
-    regularize_batch_sizeD = 16
-    regularize_batch_sizeG = 16
+    batch_sizeD = 16
+    batch_sizeG = 16
+    regularize_batch_sizeD = 8
+    regularize_batch_sizeG = 8
     use_fp16 = False
     reload = False
     drift_param = None  # 0.001
@@ -42,7 +42,7 @@ class HyperParam:
     use_adaptive_discriminator_augmentation = True
     use_contrastive_discriminator = False
     projection_dim = 512
-    truncation_trick_rate = 0.5
+    truncation_trick_rate = 0.7
     w_avg_rate = 0.995
     n_mix = 2
     mixing_regularization_rate = 0.5
@@ -53,10 +53,10 @@ class HyperParam:
         (latent_dim, latent_dim),  # 8x8
         (latent_dim, latent_dim),  # 16x16
         # (latent_dim, latent_dim),  # 32x32
-        # (latent_dim, 256),  # 64x64
+        (latent_dim, 256),  # 64x64
         (256, 128),  # 128x128
         (128, 64),  # 256x256
-        (64, 32),  # 512x512
+        # (64, 32),  # 512x512
         # (32, 16)
         ]
     latent_layers = 7
