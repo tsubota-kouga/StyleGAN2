@@ -14,7 +14,6 @@ from torch.utils import data
 from torch.utils.tensorboard import SummaryWriter
 from torch_optimizer import AdaBelief, RAdam
 from torchvision import transforms, utils
-from torchvision.transforms import functional as VF
 from tqdm import tqdm, trange
 
 from hyperparam import HyperParam as hp
@@ -59,13 +58,15 @@ if __name__ == "__main__":
         multi_resolution=False,
         transform=transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+            # transforms.Lambda(lambd=lambda x: x * 2. - 1.)
+            # transforms.Normalize(mean=(0., 0., 0.), std=(1., 1., 1.))
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
         ]),
         use_fp16=hp.use_fp16)
 
     dataloader = data.DataLoader(
         dataset,
-        batch_size=hp.batch_sizeD,
+        batch_size=hp.batch_sizeD * hp.gradient_accumulation,
         shuffle=True,
         pin_memory=True,
         num_workers=16)
@@ -114,6 +115,7 @@ if __name__ == "__main__":
     if hp.use_adaptive_discriminator_augmentation:
         data_augmentation = AdaptiveAugmentation(
             speed=hp.discriminator_augmentation_speed,
+            p=0.
             ).to(hp.device, non_blocking=hp.non_blocking)
     else:
         data_augmentation = None
@@ -157,7 +159,7 @@ if __name__ == "__main__":
             gp_param=hp.gp_param,
             drift_param=hp.drift_param,
             eps=hp.eps)
-    elif hp.gan_loss == "relativistic_hinge":
+    elif hp.gan_loss == "relativistic-hinge":
         criterionG = RelativisticAverageHingeGeneratorLoss()
         criterionD = RelativisticAverageHingeDiscriminatorLoss(
             gp_param=hp.gp_param,
@@ -291,147 +293,180 @@ if __name__ == "__main__":
     #     schedule=torch.profiler.schedule(wait=1, warmup=1, active=2),
     #     on_trace_ready=profiler.tensorboard_trace_handler(hp.profile_dir)) as p:
     for epoch in trange(hp.num_epoch):
-        for idx, imgs in enumerate(tqdm(dataloader)):
+        for imgs in tqdm(dataloader):
             B = imgs.shape[0]
 
-            if B % hp.minibatch_stddev_groups_size != 0:
-                if B >= hp.minibatch_stddev_groups_size:
-                    imgs = imgs[:-(B % hp.minibatch_stddev_groups_size)]
-                    B = imgs.shape[0]
+            if B != hp.batch_sizeD * hp.gradient_accumulation:
+                continue
+            # if B % hp.minibatch_stddev_groups_size != 0:
+            #     if B >= hp.minibatch_stddev_groups_size:
+            #         imgs = imgs[:-(B % hp.minibatch_stddev_groups_size)]
+            #         B = imgs.shape[0]
 
+            imgs_batches = []
+            fakes_batches = []
+
+            for idx in range(hp.gradient_accumulation):
+                with cuda.amp.autocast(enabled=hp.use_fp16):
+                    _imgs = imgs.to(hp.device, non_blocking=hp.non_blocking).requires_grad_(True)
+                    noise = torch.randn(
+                        B, hp.latent_dim, hp.n_mix, 1,
+                        dtype=torch.float16 if hp.use_fp16 else torch.float32,
+                        device=hp.device)
+
+                    styles = style_mapper(
+                        noise,
+                        mixing_regularization_rate=hp.mixing_regularization_rate)
+                    fakes = generator(styles=styles)[-1]
+
+                    if hp.use_adaptive_discriminator_augmentation:
+                        with cuda.amp.autocast(False):
+                            fakes_not_augmented = fakes
+                            if hp.use_unet_decoder:
+                                _imgs, fakes = data_augmentation(_imgs.float(), fakes.float())
+                            else:
+                                _imgs, = data_augmentation(_imgs.float())
+                                fakes, = data_augmentation(fakes.float())
+                    else:
+                        fakes_not_augmented = None
+                    imgs_batches.append(_imgs)
+                    fakes_batches.append(fakes)
+
+                # Generator train
             with cuda.amp.autocast(enabled=hp.use_fp16):
-                imgs = imgs.to(hp.device, non_blocking=hp.non_blocking).requires_grad_(True)
-                noise = torch.randn(
-                    B, hp.latent_dim, hp.n_mix, 1,
-                    dtype=torch.float16 if hp.use_fp16 else torch.float32,
-                    device=hp.device)
-
-                styles = style_mapper(
-                    noise,
-                    mixing_regularization_rate=hp.mixing_regularization_rate)
-                fakes = generator(styles=styles)[-1]
-
-                if hp.use_adaptive_discriminator_augmentation:
-                    with cuda.amp.autocast(False):
-                        fakes_not_augmented = fakes
-                        if hp.use_unet_decoder:
-                            imgs, fakes = data_augmentation(imgs.float(), fakes.float())
-                        else:
-                            imgs, = data_augmentation(imgs.float())
-                            fakes, = data_augmentation(fakes.float())
-                else:
-                    fakes_not_augmented = None
-
-            # Generator train
-            with cuda.amp.autocast(enabled=hp.use_fp16):
-                discriminator.eval()
-                lossG = criterionG(
-                        discriminator,
-                        fakes=fakes,
-                        reals=imgs,
-                        fakes_not_augmented=fakes_not_augmented if fakes_not_augmented is not None else fakes,
-                        latents=styles,
-                        scaler=scaler)
                 style_mapper.zero_grad(set_to_none=True)
                 generator.zero_grad(set_to_none=True)
+                lossG_items = []
+                lossPL_items = []
+
+                for imgs, fakes in zip(imgs_batches, fakes_batches):
+                    discriminator.eval()
+                    lossG = criterionG(
+                            discriminator,
+                            fakes=fakes,
+                            reals=imgs,
+                            fakes_not_augmented=fakes_not_augmented if fakes_not_augmented is not None else fakes,
+                            latents=styles,
+                            scaler=scaler)
+                    lossG_items.append(lossG.item())
+                    if scaler is not None:
+                        scaler.scale(lossG).backward()
+                    else:
+                        lossG.backward()
+                    del lossG
+                    cuda.empty_cache()
+                    cuda.synchronize(hp.device)
 
                 if scaler is not None:  # hp.use_fp16
-                    scaler.scale(lossG).backward()
                     scaler.step(optimizerSM)
                     scaler.step(optimizerG)
                     scaler.update()
                 else:
-                    lossG.backward()
                     optimizerSM.step()
                     optimizerG.step()
 
                 if hp.move_average_rate is not None:
                     update_average(style_mapper_, style_mapper, hp.move_average_rate)
                     update_average(generator_, generator, hp.move_average_rate)
-                lossG_item = lossG.item()
-                del lossG
-                cuda.synchronize(hp.device)
+
+                lossG = sum(lossG_items) / hp.gradient_accumulation
 
                 # PathLengthRegularization
                 if not hp.regularize_with_main_loss and global_step % hp.path_length_per == 1:
-                    noise = torch.randn(
-                        B, hp.latent_dim, hp.n_mix, 1,
-                        dtype=torch.float16 if hp.use_fp16 else torch.float32,
-                        device=hp.device)
-                    styles = style_mapper(noise, mixing_regularization_rate=hp.n_mix)
-                    fakes = generator(styles=styles)[-1]
-                    lossPL = hp.path_length_param * hp.path_length_per * path_length_regularization(
-                            fakes=fakes,
-                            latents=styles,
-                            scaler=scaler)
+                    for fakes in fakes_batches:
+                        noise = torch.randn(
+                            B, hp.latent_dim, hp.n_mix, 1,
+                            dtype=torch.float16 if hp.use_fp16 else torch.float32,
+                            device=hp.device)
+                        styles = style_mapper(noise, mixing_regularization_rate=hp.n_mix)
+                        fakes = generator(styles=styles)[-1]
+                        lossPL = hp.path_length_param * hp.path_length_per * path_length_regularization(
+                                fakes=fakes,
+                                latents=styles,
+                                scaler=scaler)
 
-                    generator.zero_grad(set_to_none=True)
+                        generator.zero_grad(set_to_none=True)
+                        lossPL_items.append(lossPL.item())
+
+                        if scaler is not None:
+                            scaler.scale(lossPL).backward()
+                        else:
+                            lossPL.backward()
+
+                        del lossPL
+                        cuda.empty_cache()
+                        cuda.synchronize(hp.device)
 
                     if scaler is not None:  # hp.use_fp16
-                        scaler.scale(lossPL).backward()
                         scaler.step(optimizerG)
                         scaler.update()
                     else:
-                        lossPL.backward()
                         optimizerG.step()
-                    lossPL_item = lossPL.item()
-                    del lossPL
-                    cuda.synchronize(hp.device)
-                    lossPL_stat = lossPL_item
-                lossG = lossG_item
-                cuda.empty_cache()
-                tmp = fakes.detach().clone()
-                del fakes
-                fakes = tmp
+
+                    lossPL_stat = sum(lossPL_items) / hp.gradient_accumulation
+
+                fakes_batches = list(map(lambda f: f.detach(), fakes_batches))
 
             # Discriminator train
             with cuda.amp.autocast(enabled=hp.use_fp16):
                 discriminator.train()
-                for param in discriminator.parameters():
-                    param.requires_grad = True
+                lossD_items = []
+                lossR1_items = []
+                for imgs, fakes in zip(imgs_batches, fakes_batches):
+                    for param in discriminator.parameters():
+                        param.requires_grad = True
 
-                lossD = criterionD(
-                        discriminator,
-                        fakes=fakes.detach(),
-                        reals=imgs.detach().requires_grad_(),
-                        scaler=scaler)
+                    lossD = criterionD(
+                            discriminator,
+                            fakes=fakes.detach(),
+                            reals=imgs.detach().requires_grad_(),
+                            scaler=scaler)
 
-                if type(lossD) is tuple:
-                    lossD = sum(lossD)
-                discriminator.zero_grad(set_to_none=True)
+                    if type(lossD) is tuple:
+                        lossD = sum(lossD)
+                    discriminator.zero_grad(set_to_none=True)
+                    lossD_items.append(lossD.item())
+                    if scaler is not None:
+                        scaler.scale(lossD).backward()
+                    else:
+                        lossD.backward()
+                    del lossD
+                    cuda.empty_cache()
+                    cuda.synchronize(hp.device)
+
 
                 if scaler is not None:  # hp.use_fp16
-                    scaler.scale(lossD).backward()
                     scaler.step(optimizerD)
                     scaler.update()
                 else:
-                    lossD.backward()
                     optimizerD.step()
-                lossD_item = lossD.item()
-                del lossD
-                cuda.synchronize(hp.device)
+
+                lossD = sum(lossD_items) / hp.gradient_accumulation
 
                 # R1Regularization
                 if not hp.regularize_with_main_loss and global_step % hp.r1_per == 1:
-                    lossR1 = hp.r1_param * hp.r1_per * r1_regularization(
-                            imgs,
-                            discriminator=discriminator,
-                            scaler=scaler)
-                    discriminator.zero_grad(set_to_none=True)
+                    for imgs, fakes in zip(imgs_batches, fakes_batches):
+                        lossR1 = hp.r1_param * hp.r1_per * r1_regularization(
+                                imgs,
+                                discriminator=discriminator,
+                                scaler=scaler)
+                        discriminator.zero_grad(set_to_none=True)
+                        lossR1_items.append(lossR1.item())
+                        if scaler is not None:  # hp.use_fp16
+                            scaler.scale(lossR1).backward()
+                        else:
+                            lossR1.backward()
+                        del lossR1
+                        cuda.empty_cache()
+                        cuda.synchronize(hp.device)
+
                     if scaler is not None:  # hp.use_fp16
-                        scaler.scale(lossR1).backward()
                         scaler.step(optimizerD)
                         scaler.update()
                     else:
-                        lossR1.backward()
                         optimizerD.step()
-                    lossR1_item = lossR1.item()
-                    del lossR1
-                    cuda.synchronize(hp.device)
-                    lossR1_stat = lossR1_item
 
-                lossD = lossD_item
-                cuda.empty_cache()
+                    lossR1_stat = sum(lossR1_items) / hp.gradient_accumulation
 
             # LOG
             def evaluate():
@@ -477,9 +512,12 @@ if __name__ == "__main__":
                     writer.add_image(
                         f"real img",
                         utils.make_grid(
-                            imgs,
+                            # torch.clip((imgs_batches[-1] + 1.) / 2, min=0, max=1),
+                            # torch.clip(imgs_batches[-1], min=0, max=1),
+                            imgs_batches[-1],
                             nrow=4,
                             padding=1,
+                            # value_range=(0, 1),
                             normalize=True),
                         global_step)
                     for idx, fake in enumerate(fakes):
@@ -491,9 +529,11 @@ if __name__ == "__main__":
                         writer.add_image(
                             f"generated imgs {size}x{size}",
                             utils.make_grid(
+                                # torch.clip(fake, min=0, max=1),
                                 fake,
                                 nrow=4,
                                 padding=1,
+                                # value_range=(0, 1),
                                 normalize=True),
                             global_step)
                     if hp.use_unet_decoder:
@@ -501,7 +541,7 @@ if __name__ == "__main__":
                             f"unet out imgs",
                             utils.make_grid(
                                 torch.sigmoid(fake_unet_out),
-                                padding=1, nrow=4, normalize=False, range=(0, 1)),
+                                padding=1, nrow=4, normalize=False),
                             global_step)
             if global_step % 50 == 0:
                 evaluate()

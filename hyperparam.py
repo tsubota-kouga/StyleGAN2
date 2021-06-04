@@ -16,6 +16,7 @@ class HyperParam:
     batch_sizeG = 16
     regularize_batch_sizeD = 8
     regularize_batch_sizeG = 8
+    gradient_accumulation = 1
     use_fp16 = False
     reload = False
     drift_param = None  # 0.001
@@ -47,7 +48,7 @@ class HyperParam:
     n_mix = 2
     mixing_regularization_rate = 0.5
     noise_mode = "random"  # ["const-deterministic", "const-random", "deterministic", "random"]
-    latent_dim = 256
+    latent_dim = 512
     channel_info = [
         (latent_dim, latent_dim),  # 4x4
         (latent_dim, latent_dim),  # 8x8
@@ -55,11 +56,11 @@ class HyperParam:
         # (latent_dim, latent_dim),  # 32x32
         (latent_dim, 256),  # 64x64
         (256, 128),  # 128x128
-        (128, 64),  # 256x256
+        # (128, 64),  # 256x256
         # (64, 32),  # 512x512
         # (32, 16)
         ]
-    latent_layers = 7
+    latent_layers = 8
     betas = (0.0, 0.99)
     # betas = (0.5, 0.999)
     if r1_per is not None:

@@ -356,6 +356,7 @@ class LowPassFilter(nn.Module):
         x = self.pad(x)
         x = F.conv2d(x, self.sym6[..., None, :].expand(C, -1, -1, -1), groups=C)
         x = F.conv2d(x, self.sym6[..., :, None].expand(C, -1, -1, -1), groups=C)
+        x = self.down(x)
         return x
 
 
@@ -372,10 +373,11 @@ class HighPassFilter(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         _, C, _, _ = input.shape
-        x = self.pad(input)
+        x = self.up(input)
+        x = self.pad(x)
         x = F.conv2d(x, self.sym6[..., None, :].expand(C, -1, -1, -1), groups=C)
         x = F.conv2d(x, self.sym6[..., :, None].expand(C, -1, -1, -1), groups=C)
-        x = self.down(input)
+        x = self.down(x)
         return x
 
 
@@ -390,8 +392,8 @@ class AdaptiveAugmentation(nn.Module):
         self.sym2_dwt = DWTForward(wave="sym2", mode="reflect")
         self.sym2_iwt = DWTInverse(wave="sym2", mode="reflect")
 
-        self.sym6_low = LowPassFilter("sym6", up=2)
-        self.sym6_high = HighPassFilter("sym6", down=2)
+        self.sym6_low = LowPassFilter("sym6", up=2, down=1)
+        self.sym6_high = HighPassFilter("sym6", down=2, up=1)
 
     def forward(self, *input: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         return self.augmentation(*input)
@@ -476,6 +478,7 @@ class AdaptiveAugmentation(nn.Module):
                 s=(torch.tensor([2.,], device=device).expand(B),
                    torch.tensor([2.,], device=device).expand(B)))
 
+        # x = tuple(F.interpolate(_x, scale_factor=2.) for _x in x)
         x = tuple(self.sym6_low(_x) for _x in x)
         x = tuple(geometry.warp_affine(
             _x, G_inv[:, :2],
@@ -483,6 +486,7 @@ class AdaptiveAugmentation(nn.Module):
             padding_mode="reflection",
             align_corners=False) for _x in x)
         x = tuple(self.sym6_high(_x) for _x in x)
+        # x = tuple(F.interpolate(_x, scale_factor=0.5) for _x in x)
 
         with torch.no_grad():
             C = torch.eye(n=4, device=device, dtype=dtype).repeat(B, 1, 1)
