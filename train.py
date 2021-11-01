@@ -2,14 +2,11 @@
 import argparse
 import copy
 from datetime import datetime
-import math
 import os
-import random
 from typing import Final, Optional
 
-import numpy as np
 import torch
-from torch import backends, cuda, nn, optim, profiler
+from torch import backends, cuda, nn, optim
 from torch.utils import data
 from torch.utils.tensorboard import SummaryWriter
 from torch_optimizer import AdaBelief, RAdam
@@ -115,7 +112,7 @@ if __name__ == "__main__":
     if hp.use_adaptive_discriminator_augmentation:
         data_augmentation = AdaptiveAugmentation(
             speed=hp.discriminator_augmentation_speed,
-            p=0.
+            p=0.0
             ).to(hp.device, non_blocking=hp.non_blocking)
     else:
         data_augmentation = None
@@ -197,18 +194,22 @@ if __name__ == "__main__":
             lr=hp.smlr,
             eps=hp.eps,
             betas=hp.betas,
-            weight_decay=hp.weight_decay)
+            weight_decay=hp.weight_decay,
+            amsgrad=True)
         optimizerG = optim.Adam(
             generator.parameters(),
             lr=hp.glr,
             eps=hp.eps,
             betas=hp.betas,
-            weight_decay=hp.weight_decay)
+            weight_decay=hp.weight_decay,
+            amsgrad=True)
         optimizerD = optim.Adam(
             discriminator.parameters(),
             lr=hp.dlr,
             eps=hp.eps,
-            betas=hp.betas)
+            betas=hp.betas,
+            weight_decay=hp.weight_decay,
+            amsgrad=True)
     elif hp.optimizer == "radam":
         optimizerSM = RAdam(
             style_mapper.parameters(),
@@ -233,18 +234,25 @@ if __name__ == "__main__":
             lr=hp.smlr,
             eps=hp.eps,
             betas=hp.betas,
-            weight_decay=hp.weight_decay)
+            weight_decay=hp.weight_decay,
+            amsgrad=True,
+            weight_decouple=True)
         optimizerG = AdaBelief(
             generator.parameters(),
             lr=hp.glr,
             eps=hp.eps,
             betas=hp.betas,
-            weight_decay=hp.weight_decay)
+            weight_decay=hp.weight_decay,
+            amsgrad=True,
+            weight_decouple=True)
         optimizerD = AdaBelief(
             discriminator.parameters(),
             lr=hp.dlr,
             eps=hp.eps,
-            betas=hp.betas)
+            betas=hp.betas,
+            weight_decay=hp.weight_decay,
+            amsgrad=True,
+            weight_decouple=True)
     elif hp.optimizer == "rmsprop":
         optimizerSM = optim.RMSprop(
             style_mapper.parameters(),
@@ -543,11 +551,11 @@ if __name__ == "__main__":
                                 torch.sigmoid(fake_unet_out),
                                 padding=1, nrow=4, normalize=False),
                             global_step)
-            if global_step % 50 == 0:
+            if global_step % 100 == 0:
                 evaluate()
                 cuda.empty_cache()
 
-            if global_step % 500 == 0:
+            if global_step % 1000 == 0:
                 t = datetime.today()
                 torch.save({
                     "style_mapper": style_mapper.state_dict(),
@@ -559,7 +567,7 @@ if __name__ == "__main__":
                     "optimizerD": optimizerD.state_dict(),
                     "optimizerSM": optimizerSM.state_dict(),
                     "path_length_regularization": path_length_regularization.state_dict(),
-                }, os.path.join(hp.model_dir, f"{t}.model"))
+                }, os.path.join(hp.model_dir, f"{t.date()}-{t.hour}.model"))
             global_step += 1
             # p.step()
 

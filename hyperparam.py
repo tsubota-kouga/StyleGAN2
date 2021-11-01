@@ -7,15 +7,17 @@ class HyperParam:
     dataset_path = {
         "celeba-hq": "/mnt/My Files/celeba-hq",
         "ffhq": "/mnt/My Files/ffhq",
-        "afhq-dog": "/mnt/My Files/afhq/train/dog/"
+        "afhq-dog": "/mnt/My Files/afhq/train/dog/",
+        "afhq-cat": "/mnt/My Files/afhq/train/cat/",
+        "afhq-wild": "/mnt/My Files/afhq/train/wild",
         }
     log_dir = "./log"
     profile_dir = "./profile"
     model_dir = "/mnt/My Files/stylegan-model/"
     batch_sizeD = 16
     batch_sizeG = 16
-    regularize_batch_sizeD = 8
-    regularize_batch_sizeG = 8
+    regularize_batch_sizeD = 16
+    regularize_batch_sizeG = 16
     gradient_accumulation = 1
     use_fp16 = False
     reload = False
@@ -32,12 +34,12 @@ class HyperParam:
 
     gan_loss = "non-saturating"
     optimizer = "adam"
-    smlr = 2.5e-3
-    dlr = 2.5e-3
-    glr = 2.5e-3
+    smlr = 2.0e-3
+    dlr = 2.0e-3
+    glr = 2.0e-3
     if r1_per is not None:
         dlr = dlr * (r1_per - 1) / r1_per
-    move_average_rate = 0.995
+    move_average_rate = 0.999
     non_blocking = False
     discriminator_augmentation_speed = 2e-6  # 1 / (500 * 10^3)
     use_adaptive_discriminator_augmentation = True
@@ -48,12 +50,12 @@ class HyperParam:
     n_mix = 2
     mixing_regularization_rate = 0.5
     noise_mode = "random"  # ["const-deterministic", "const-random", "deterministic", "random"]
-    latent_dim = 512
+    latent_dim = 256
     channel_info = [
         (latent_dim, latent_dim),  # 4x4
         (latent_dim, latent_dim),  # 8x8
         (latent_dim, latent_dim),  # 16x16
-        # (latent_dim, latent_dim),  # 32x32
+        (latent_dim, latent_dim),  # 32x32
         (latent_dim, 256),  # 64x64
         (256, 128),  # 128x128
         # (128, 64),  # 256x256
@@ -70,8 +72,8 @@ class HyperParam:
     device = torch.device("cuda")
     num_epoch = 5000
     weight_decay = 0
-    Gmode = "wavelet"  # [wavelet, skip]
-    Dmode = "wavelet"  # [wavelet, skip, resnet]
+    Gmode = "skip"  # [wavelet, skip]
+    Dmode = "resnet"  # [wavelet, skip, resnet]
     max_level = len(channel_info) if Gmode != "wavelet" else len(channel_info) + 1
     resolution = 2 ** (max_level + 1)
     use_scaleSM = True

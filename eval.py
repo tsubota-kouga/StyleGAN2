@@ -9,7 +9,7 @@ from torchvision import utils
 
 from hyperparam import HyperParam as hp
 from network import GeneratorV2, LatentLayers
-from utils import adjust_dynamic_range, load_generator
+from utils import adjust_dynamic_range, load_generator, hypersphere
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -54,6 +54,7 @@ if __name__ == "__main__":
                     16, hp.latent_dim, 1, 1,
                     device=hp.device,
                     dtype=torch.float16 if hp.use_fp16 else torch.float)
+            noise = hypersphere(noise)
             if hp.use_fp16:
                 with cuda.amp.autocast():
                     styles = style_mapper(noise, truncation_trick_rate=hp.truncation_trick_rate)

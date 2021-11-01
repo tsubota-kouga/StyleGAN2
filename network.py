@@ -1,20 +1,24 @@
 
 import math
 import random
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, Final
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Final
 
-from kornia.filters import filter2D
+from kornia.filters import filter2d
 import numpy as np
 from pytorch_wavelets import DWTForward, DWTInverse
 import torch
-from torch import nn, cuda
+from torch import nn
 from torch.nn import functional as F
-from utils import Up, Down
+from mmcv.ops import upfirdn2d, fused_bias_leakyrelu
 
 
 class Print(nn.Module):
+    def __init__(self, prompt: str = ""):
+        super().__init__()
+        self.prompt = prompt
+
     def forward(self, input):
-        print(input.shape)
+        print(self.prompt, ">>>", input.shape)
         return input
 
 
@@ -58,7 +62,7 @@ class Blur(nn.Module):
         self.register_buffer("filter", filter.requires_grad_(False))
 
     def forward(self, input: torch.Tensor):
-        return filter2D(
+        return filter2d(
             input=input,
             kernel=self.filter,
             normalized=True)
@@ -74,26 +78,61 @@ def fuse_weight(weight: torch.Tensor):
     return weight
 
 
-class UpConvDown(nn.Conv2d):
-    def __init__(self, *args, up: int = 0, down: int = 0, **kwargs):
-        super(UpConvDown, self).__init__(*args, **kwargs)
+class FusedBiasLeakyReLU(nn.Module):
+    def __init__(self, num_channels: int, lrmul: float = 1., negative_slope: float = 0.2, scale: float = 2 ** 0.5):
+        super(FusedBiasLeakyReLU, self).__init__()
+        self.bias = nn.Parameter(torch.zeros(num_channels, ))
+        self.lrmul = lrmul
+        self.negative_slope = negative_slope
+        self.scale = scale
+
+    def forward(self, input):
+        return fused_bias_leakyrelu(
+            input, self.bias * self.lrmul,
+            negative_slope=self.negative_slope,
+            scale=self.scale)
+
+
+
+class UpFIRDown(nn.Module):
+    def __init__(self, *, up: int = 1, down: int = 1, conv_kernel_size: Optional[int] = None):
+        super(UpFIRDown, self).__init__()
+        self.FIR_size = 4
+        fir = torch.tensor([1., 3., 3., 1.])
+        fir = fir[None, :] * fir[:, None]
+        fir = fir / fir.sum()
+        self.register_buffer("FIR", fir.requires_grad_(False))
         self.up = up
         self.down = down
+        self.conv_kernel_size = conv_kernel_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.up != 0:
-            B, C, H, W = x.shape
-            x = F.pad(
-                    x[:, :, :, None, :, None],
-                    (0, self.up,
-                     0, 0,
-                     0, self.up,
-                     0, 0), mode="constant") \
-                 .reshape(B, C, self.up * H, self.up * W)
-        x = super().forward(x)
-        if self.down != 0:
-            x = x[:, :, ::self.down, ::self.down]
-        return x
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.conv_kernel_size is None:
+            up = self.up
+            down = self.down
+            conv_kernel_size = 1
+        else:
+            up = 1
+            down = 1
+            conv_kernel_size = self.conv_kernel_size
+        if self.up != 1:
+            p = (self.FIR_size - self.up) - (conv_kernel_size - 1)
+            return upfirdn2d(input, self.FIR, up=up, down=down, pad=(
+                (p + 1) // 2 + self.up - 1,
+                p // 2 + (2 - up),  # NOTE: if with conv (2-up) == 1 else 0
+                (p + 1) // 2 + self.up - 1,
+                p // 2 + (2 - up),
+                ))
+        elif self.down != 1:
+            p = (self.FIR_size - self.down) + (conv_kernel_size - 1)
+            return upfirdn2d(input, self.FIR, up=up, down=down, pad=(
+                (p + 1) // 2 + self.up - 1,
+                p // 2,
+                (p + 1) // 2 + self.up - 1,
+                p // 2,
+                ))
+        else:
+            assert False
 
 
 class WaveletInterpolate(nn.Module):
@@ -250,7 +289,7 @@ class WeightModulatedConv(nn.Conv2d):
         weight = self.weight.unsqueeze(0) \
                 .expand(B, -1, -1, -1, -1)  # [B, Co, Ci, K, K]
         if self.use_fp16:
-            style = F.normalize(style)
+            # style = F.normalize(style)
             d = (weight.square().sum(dim=(2, 3, 4), keepdim=True) + self.eps).rsqrt()
             weight = weight * d
         weight = weight * (style + 1.) * self.scale
@@ -319,7 +358,7 @@ class WeightModulatedConvTrans(nn.ConvTranspose2d):
         weight = self.weight.unsqueeze(0) \
                             .expand(B, -1, -1, -1, -1)  # [B, Ci, Co, K, K]
         if self.use_fp16:
-            style = F.normalize(style)
+            # style = F.normalize(style)
             d = (weight.square().sum(dim=(1, 3, 4), keepdim=True) + self.eps).rsqrt()
             weight = weight * d
         weight = weight * (style + 1.) * self.scale
@@ -351,9 +390,7 @@ class WeightModulatedConvTrans(nn.ConvTranspose2d):
 
 
 class NoiseBlock(nn.Module):
-    bias: Optional[torch.Tensor]
-
-    def __init__(self, channels: int, resolution: int, mode: str, bias: bool = False):
+    def __init__(self, channels: int, resolution: int, mode: str):
         super(NoiseBlock, self).__init__()
         self.mode = mode
         self.resolution = resolution
@@ -361,10 +398,6 @@ class NoiseBlock(nn.Module):
         if mode == "deterministic":
             self.register_buffer("noise", torch.randn(1, 1, resolution, resolution))
         self.scale = nn.Parameter(torch.zeros((1, channels, 1, 1)), requires_grad=True)
-        if bias:
-            self.bias = nn.Parameter(torch.zeros([channels, 1, 1]), requires_grad=True)
-        else:
-            self.bias = None
 
     def forward(self, x: torch.Tensor, noise: Optional[torch.Tensor] = None):
         B = x.shape[0]
@@ -434,7 +467,7 @@ class GeneratorBlockV1(nn.Module):
             self.noise1 = NoiseBlock(
                 channels=in_channels,
                 resolution=self.resolution,
-                mode=noise_mode,)
+                mode=noise_mode)
             self.adain1 = AdaIN(
                 in_channels=in_channels,
                 style_channels=style_channels,
@@ -535,9 +568,9 @@ class GeneratorBlockV2(nn.Module):
         super(GeneratorBlockV2, self).__init__()
         self.first = idx == 0
         self.resolution = 2 ** (idx + 2)
-        self.activation = Activation(
-            activation=activation,
-            **activation_args)
+        # self.activation = Activation(
+        #     activation=activation,
+        #     **activation_args)
         self.noise_mode = noise_mode
         if self.noise_mode == "const-deterministic":
             self.register_buffer("noise", torch.randn(1, 1, self.resolution, self.resolution))
@@ -556,31 +589,34 @@ class GeneratorBlockV2(nn.Module):
                 use_scale=use_scale,
                 eps=eps,
                 use_fp16=use_fp16,
-                bias=True)
+                bias=False)
             self.noise1 = NoiseBlock(
                 channels=1,
                 resolution=self.resolution,
                 mode=noise_mode)
+            self.fused_leaky_relu = FusedBiasLeakyReLU(num_channels=out_channels)
         else:
-            self.upsample = nn.Sequential(
-                Up(scale=2),
-                Blur(kernel_size=3))
-            self.conv1 = WeightModulatedConv(
+            # self.upsample = nn.Sequential(
+            #     Up(scale=2),
+            #     Blur(kernel_size=3))
+            self.upsample = UpFIRDown(up=2, conv_kernel_size=3)  # DO NOT upsample, upsample with WeightModulatedConvTrans
+            self.conv1 = WeightModulatedConvTrans(
                 in_channels=in_channels,
                 out_channels=out_channels,
                 style_channels=style_channels,
                 kernel_size=3,
-                padding=1,
-                padding_mode="replicate",
+                # padding=1,
+                stride=2,
+                # padding_mode="replicate",
                 use_scale=use_scale,
                 eps=eps,
                 use_fp16=use_fp16,
-                bias=True)
-
+                bias=False)
             self.noise1 = NoiseBlock(
                 channels=1,
                 resolution=self.resolution,
                 mode=noise_mode)
+            self.fused_leaky_relu1 = FusedBiasLeakyReLU(num_channels=out_channels)
             self.conv2 = WeightModulatedConv(
                 in_channels=out_channels,
                 out_channels=out_channels,
@@ -591,11 +627,12 @@ class GeneratorBlockV2(nn.Module):
                 use_scale=use_scale,
                 eps=eps,
                 use_fp16=use_fp16,
-                bias=True)
+                bias=False)
             self.noise2 = NoiseBlock(
                 channels=1,
                 resolution=self.resolution,
                 mode=noise_mode)
+            self.fused_leaky_relu2 = FusedBiasLeakyReLU(num_channels=out_channels)
 
     def forward(self,
                 x: Optional[torch.Tensor] = None,
@@ -609,18 +646,21 @@ class GeneratorBlockV2(nn.Module):
         if self.first:
             x = self.conv1(self.const.expand(B, -1, -1, -1), style)
             x = self.noise1(x, noise)
-            x = self.activation(x)
+            # x = self.activation(x)
+            x = self.fused_leaky_relu(x)
             return x
         else:
+            x = self.conv1(x, style)
             x = self.upsample(x)
 
-            x = self.conv1(x, style)
             x = self.noise1(x, noise)
-            x = self.activation(x)
+            # x = self.activation(x)
+            x = self.fused_leaky_relu1(x)
 
             x = self.conv2(x, style)
             x = self.noise2(x, noise)
-            x = self.activation(x)
+            # x = self.activation(x)
+            x = self.fused_leaky_relu2(x)
             return x
 
 
@@ -644,10 +684,13 @@ class LatentLayers(nn.Module):
                     out_channels=style_channels,
                     kernel_size=1,
                     use_scale=use_scale,
-                    lrmul=lrmul),
-                Activation(
-                    activation=activation,
-                    **activation_args))
+                    lrmul=lrmul,
+                    bias=False),
+                FusedBiasLeakyReLU(num_channels=style_channels, lrmul=lrmul)
+                # Activation(
+                #     activation=activation,
+                #     **activation_args),
+                )
               for _ in range(num_layers)])
 
         self.eps = eps
@@ -735,9 +778,10 @@ class GeneratorV2(nn.Module):
             self.upsample = WaveletInterpolate(scale_factor=2)
             self.iwt = DWTInverse(wave="haar", mode="reflect")
         elif mode == "skip":
-            self.upsample = nn.Sequential(
-                nn.Upsample(mode="nearest", scale_factor=2., align_corners=False),
-                Blur(kernel_size=3))
+            # self.upsample = nn.Sequential(
+            #     nn.Upsample(mode="bilinear", scale_factor=2., align_corners=False),
+            #     Blur(kernel_size=3))
+            self.upsample = UpFIRDown(up=2)
         else:
             assert False
 
@@ -751,6 +795,7 @@ class GeneratorV2(nn.Module):
                 img = to_rgb(x, style)
             else:
                 img = to_rgb(x, style) + self.upsample(img)
+
             if self.mode == "wavelet":
                 B, _, H, W = x.shape
                 C = 3
@@ -805,13 +850,16 @@ class DiscriminatorBlock(nn.Module):
         self.use_minibatch_stddev_all = use_minibatch_stddev_all
         if mode == "resnet":
             self.residual = nn.Sequential(
-                Blur(kernel_size=3), Down(scale=2),
+                # Blur(kernel_size=3), Down(scale=2),
+                UpFIRDown(down=2, conv_kernel_size=1),
                 WeightScaledConv(
                     in_channels=in_channels,
                     out_channels=out_channels,
                     kernel_size=1,
+                    stride=2,
                     use_scale=use_scale,
-                    padding_mode="replicate"))
+                    bias=True),
+                )
                 # WeightScaledConv(
                 #     in_channels=in_channels,
                 #     out_channels=out_channels,
@@ -829,24 +877,31 @@ class DiscriminatorBlock(nn.Module):
                 out_channels=out_channels,
                 kernel_size=3,
                 padding=1,
+                bias=False,
                 use_scale=use_scale,
                 padding_mode="replicate",
                 use_fp16=use_fp16),
-            Activation(
-                activation=activation,
-                **activation_args),
-            Blur(kernel_size=3), Down(scale=2),
+            FusedBiasLeakyReLU(num_channels=out_channels),
+            # Activation(
+            #     activation=activation,
+            #     **activation_args),
+            # Blur(kernel_size=3), Down(scale=2),
+            UpFIRDown(down=2, conv_kernel_size=3),
             WeightScaledConv(
                 in_channels=out_channels,
                 out_channels=out_channels,
                 kernel_size=3,
-                padding=1,
+                # padding=1,
+                stride=2,
+                bias=False,
                 use_scale=use_scale,
-                padding_mode="replicate",
+                # padding_mode="replicate",
                 use_fp16=use_fp16),
-            Activation(
-                activation=activation,
-                **activation_args))
+            FusedBiasLeakyReLU(num_channels=out_channels)
+            # Activation(
+            #     activation=activation,
+            #     **activation_args)
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.mode == "resnet":  # img is None
@@ -854,7 +909,7 @@ class DiscriminatorBlock(nn.Module):
             if self.use_minibatch_stddev_all:
                 x = self.minibatch_stddev(x)
             x = self.net(x)
-            x = (x + residual) / np.sqrt(2)
+            x = (x + residual) * (1. / math.sqrt(2))
         elif self.mode == "skip" or self.mode == "wavelet":  # x may be None
             if self.use_minibatch_stddev_all:
                 x = self.minibatch_stddev(x)
@@ -936,10 +991,13 @@ class DiscriminatorV2(nn.Module):
                     in_channels=3,
                     out_channels=channel_info[-1][1],
                     kernel_size=1,
-                    use_scale=use_scale),
-                Activation(
-                    activation=activation,
-                    **activation_args))
+                    use_scale=use_scale,
+                    bias=False),
+                FusedBiasLeakyReLU(num_channels=channel_info[-1][1])
+                # Activation(
+                #     activation=activation,
+                #     **activation_args),
+                )
         elif mode == "skip" or mode == "wavelet":
             self.from_rgb = nn.ModuleList([
                 nn.Sequential(
@@ -947,14 +1005,18 @@ class DiscriminatorV2(nn.Module):
                         in_channels=3 if mode == "skip" else 12,
                         out_channels=out_channels,
                         kernel_size=1,
-                        use_scale=use_scale),
-                    Activation(
-                        activation=activation,
-                        **activation_args))
+                        use_scale=use_scale,
+                        bias=False),
+                    FusedBiasLeakyReLU(num_channels=out_channels)
+                    # Activation(
+                    #     activation=activation,
+                    #     **activation_args),
+                    )
                     for _, out_channels in reversed(channel_info)])
             if mode == "skip":
-                self.downsample = lambda x: \
-                    F.interpolate(x, scale_factor=0.5, mode="bilinear", align_corners=False)
+                # self.downsample = lambda x: \
+                #     F.interpolate(x, scale_factor=0.5, mode="bilinear", align_corners=False)
+                self.downsample = UpFIRDown(down=2)
             elif mode == "wavelet":
                 self.dwt = DWTForward(wave="haar", mode="reflect")
                 self.downsample = WaveletInterpolate(scale_factor=0.5)
@@ -982,14 +1044,19 @@ class DiscriminatorV2(nn.Module):
                 in_channels=channel_info[0][0] + 1,
                 out_channels=channel_info[0][0],
                 kernel_size=3,
-                use_scale=use_scale),
-            Activation(activation=activation, **activation_args),
+                use_scale=use_scale,
+                bias=False),
+            FusedBiasLeakyReLU(num_channels=channel_info[0][0]),
+            # Activation(activation=activation, **activation_args),
             nn.Flatten(),
             WeightScaledLinear(
                 in_features=channel_info[0][0] * 4,
                 out_features=channel_info[0][0],
-                use_scale=use_scale),
-            Activation(activation=activation, **activation_args))
+                use_scale=use_scale,
+                bias=False),
+            FusedBiasLeakyReLU(num_channels=channel_info[0][0])
+            # Activation(activation=activation, **activation_args)
+            )
 
         if use_unet_decoder:
             self.unet_convolutions = nn.ModuleList([
@@ -1018,35 +1085,49 @@ class DiscriminatorV2(nn.Module):
                 WeightScaledLinear(
                     in_features=channel_info[0][0],
                     out_features=projection_dim,
-                    use_scale=use_scale),
-                Activation(activation=activation, **activation_args),
+                    use_scale=use_scale,
+                    bias=False),
+                FusedBiasLeakyReLU(num_channels=projection_dim),
+                # Activation(activation=activation, **activation_args),
                 WeightScaledLinear(
                     in_features=projection_dim,
                     out_features=projection_dim,
-                    use_scale=use_scale),
-                Activation(activation=activation, **activation_args))
+                    use_scale=use_scale,
+                    bias=False),
+                FusedBiasLeakyReLU(num_channels=projection_dim)
+                # Activation(activation=activation, **activation_args)
+                )
             self.projection_negative = nn.Sequential(
                 WeightScaledLinear(
                     in_features=channel_info[0][0],
                     out_features=projection_dim,
-                    use_scale=use_scale),
-                Activation(activation=activation, **activation_args),
+                    use_scale=use_scale,
+                    bias=False),
+                FusedBiasLeakyReLU(num_channels=projection_dim),
+                # Activation(activation=activation, **activation_args),
                 WeightScaledLinear(
                     in_features=projection_dim,
                     out_features=projection_dim,
-                    use_scale=use_scale),
-                Activation(activation=activation, **activation_args))
+                    use_scale=use_scale,
+                    bias=False),
+                FusedBiasLeakyReLU(num_channels=projection_dim)
+                # Activation(activation=activation, **activation_args)
+                )
             self.out = nn.Sequential(
                 WeightScaledLinear(
                     in_features=channel_info[0][0],
                     out_features=channel_info[0][0],
-                    use_scale=use_scale),
-                Activation(activation=activation, **activation_args),
+                    use_scale=use_scale,
+                    bias=False),
+                FusedBiasLeakyReLU(num_channels=channel_info[0][0]),
+                # Activation(activation=activation, **activation_args),
                 WeightScaledLinear(
                     in_features=channel_info[0][0],
                     out_features=projection_dim,
-                    use_scale=use_scale),
-                Activation(activation=activation, **activation_args),
+                    use_scale=use_scale,
+                    bias=False),
+                FusedBiasLeakyReLU(num_channels=projection_dim),
+                # Activation(activation=activation, **activation_args),
                 WeightScaledLinear(
                     in_features=projection_dim,
                     out_features=1,
@@ -1055,7 +1136,8 @@ class DiscriminatorV2(nn.Module):
             self.out = WeightScaledLinear(
                 in_features=channel_info[0][0],
                 out_features=1,
-                use_scale=use_scale)
+                use_scale=use_scale,
+                bias=True)
 
     def get_feature_with_resnet(self, img: torch.Tensor) \
             -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:

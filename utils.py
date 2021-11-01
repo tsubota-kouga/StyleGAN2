@@ -20,6 +20,7 @@ from torch.nn import functional as F
 from torch.utils import data
 from torchvision import transforms
 from pytorch_wavelets import DWTForward, DWTInverse
+from mmcv.ops import upfirdn2d
 from tqdm import tqdm
 
 
@@ -237,14 +238,22 @@ def update_average(target, source, beta):
 
     toggle_grad(target, False)
     toggle_grad(source, False)
-    param_dict_src = dict(source.named_parameters())
-    for p_name, p_target in target.named_parameters():
-        p_source = param_dict_src[p_name]
+    for p_target, p_source in zip(target.parameters(), source.parameters()):
         if p_source.isnan().any():
             print("detect nan")
             continue
-        assert p_source is not p_target
-        p_target.copy_(beta * p_target + (1.0 - beta) * p_source)
+        p_target.copy_(p_source.lerp(p_target, beta))
+    for b_target, b_source in zip(target.buffers(), source.buffers()):
+        b_target.copy_(b_source)
+    # param_dict_src = dict(source.named_parameters())
+    # for p_name, p_target in target.named_parameters():
+    #     p_source = param_dict_src[p_name]
+    #     if p_source.isnan().any():
+    #         print("detect nan")
+    #         continue
+    #     assert p_source is not p_target
+    #     p_target.copy_(beta * p_target + (1.0 - beta) * p_source)
+
     toggle_grad(target, True)
     toggle_grad(source, True)
 
@@ -342,42 +351,40 @@ def wavelet_bandpass_filters(wt: str) -> torch.Tensor:
 class LowPassFilter(nn.Module):
     def __init__(self, wt: str, up: int = 2, down: int = 1):
         super(LowPassFilter, self).__init__()
-        self.up = Up(up)
-        self.down = Down(down)
-        filter_bank = pywt.Wavelet(wt).filter_bank
-        H_z, _, _, _ = filter_bank  # H(z), H(-z^-1), H(z^-1), H(-z)
-        self.sym6 = nn.Parameter(torch.tensor(H_z)[None, None, :])
+        self.up = up
+        self.down = down
+        H_z, _, _, _ = pywt.Wavelet(wt).filter_bank  # H(z), H(-z^-1), H(z^-1), H(-z)
+        sym6 = torch.tensor(H_z)
+        self.sym6 = nn.Parameter(sym6[None, :] * sym6[:, None])
         self.filter_length = len(H_z)
-        self.pad = nn.ReflectionPad2d((self.filter_length - up) // 2)
+        self.pad = (self.filter_length - up) // 2
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        _, C, _, _ = input.shape
-        x = self.up(input)
-        x = self.pad(x)
-        x = F.conv2d(x, self.sym6[..., None, :].expand(C, -1, -1, -1), groups=C)
-        x = F.conv2d(x, self.sym6[..., :, None].expand(C, -1, -1, -1), groups=C)
-        x = self.down(x)
+        x = upfirdn2d(input,
+                      kernel=self.sym6,
+                      up=self.up,
+                      down=self.down,
+                      pad=(self.pad, self.pad))
         return x
 
 
 class HighPassFilter(nn.Module):
     def __init__(self, wt: str, up: int = 1, down: int = 2):
         super(HighPassFilter, self).__init__()
-        self.up = Up(up)
-        self.down = Down(down)
-        filter_bank = pywt.Wavelet(wt).filter_bank
-        _, _, H_z_inv, _ = filter_bank  # H(z), H(-z^-1), H(z^-1), H(-z)
-        self.sym6 = nn.Parameter(torch.tensor(H_z_inv)[None, None, :])
+        self.up = up
+        self.down = down
+        _, _, H_z_inv, _ = pywt.Wavelet(wt).filter_bank  # H(z), H(-z^-1), H(z^-1), H(-z)
+        sym6 = torch.tensor(H_z_inv)
+        self.sym6 = nn.Parameter(sym6[None, :] * sym6[:, None])
         self.filter_length = len(H_z_inv)
-        self.pad = nn.ReflectionPad2d((self.filter_length - up) // 2)
+        self.pad = (self.filter_length - up) // 2
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        _, C, _, _ = input.shape
-        x = self.up(input)
-        x = self.pad(x)
-        x = F.conv2d(x, self.sym6[..., None, :].expand(C, -1, -1, -1), groups=C)
-        x = F.conv2d(x, self.sym6[..., :, None].expand(C, -1, -1, -1), groups=C)
-        x = self.down(x)
+        x = upfirdn2d(input,
+                      kernel=self.sym6,
+                      up=self.up,
+                      down=self.down,
+                      pad=(self.pad, self.pad))
         return x
 
 
